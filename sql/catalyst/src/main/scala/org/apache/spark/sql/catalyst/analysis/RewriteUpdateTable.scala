@@ -17,12 +17,12 @@
 
 package org.apache.spark.sql.catalyst.analysis
 
-import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, AttributeReference, EqualNullSafe, Expression, If, Literal, MetadataAttribute, Not, SubqueryExpression}
+import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, AttributeReference, Cast, EqualNullSafe, Expression, If, Literal, MetadataAttribute, Not, SubqueryExpression}
 import org.apache.spark.sql.catalyst.expressions.Literal.TrueLiteral
 import org.apache.spark.sql.catalyst.plans.logical.{Assignment, Expand, Filter, LogicalPlan, Project, ReplaceData, Union, UpdateTable, WriteDelta}
 import org.apache.spark.sql.catalyst.util.RowDeltaUtils._
 import org.apache.spark.sql.connector.catalog.SupportsRowLevelOperations
-import org.apache.spark.sql.connector.write.{RowLevelOperationTable, SupportsDelta}
+import org.apache.spark.sql.connector.write.{RowLevelOperationTable, SupportsColumnUpdate, SupportsDelta}
 import org.apache.spark.sql.connector.write.RowLevelOperation.Command.UPDATE
 import org.apache.spark.sql.execution.datasources.v2.{DataSourceV2Relation, ExtractV2Table}
 import org.apache.spark.sql.types.IntegerType
@@ -152,9 +152,15 @@ object RewriteUpdateTable extends RewriteRowLevelCommand {
       cond: Expression): WriteDelta = {
 
     val operation = operationTable.operation.asInstanceOf[SupportsDelta]
+    val supportsColumnUpdate = operation.isInstanceOf[SupportsColumnUpdate]
+
+    if (supportsColumnUpdate && operation.representUpdateAsDeleteAndInsert) {
+      logWarning(s"${operation.getClass.getSimpleName} implements SupportsColumnUpdate but " +
+        s"also returns representUpdateAsDeleteAndInsert()=true; " +
+        s"column-update optimization is disabled, full row will be sent to DeltaWriter.update")
+    }
 
     // resolve all needed attrs (e.g. row ID and any required metadata attrs)
-    val rowAttrs = relation.output
     val rowIdAttrs = resolveRowIdAttrs(relation, operation)
     val metadataAttrs = resolveRequiredMetadataAttrs(relation, operation)
 
@@ -169,10 +175,43 @@ object RewriteUpdateTable extends RewriteRowLevelCommand {
       buildWriteDeltaUpdateProjection(matchedRowsPlan, assignments, rowIdAttrs)
     }
 
+    // when column update is supported, narrow rowAttrs to only changed columns so LogicalWriteInfo.schema()
+    // carries a partial schema
+    val effectiveRowAttrs =
+      if (supportsColumnUpdate && !operation.representUpdateAsDeleteAndInsert) {
+        computeAssignedAttrs(assignments)
+      } else {
+        relation.output
+      }
+
     // build a plan to write the row delta to the table
     val writeRelation = relation.copy(table = operationTable)
-    val projections = buildWriteDeltaProjections(rowDeltaPlan, rowAttrs, rowIdAttrs, metadataAttrs)
+    val projections = buildWriteDeltaProjections(
+      rowDeltaPlan, effectiveRowAttrs, rowIdAttrs, metadataAttrs)
     WriteDelta(writeRelation, cond, rowDeltaPlan, relation, projections)
+  }
+
+  // returns only the table attributes that are updated (changed) in this UPDATE;
+  // identity assignments (SET col = col) are excluded. Implicit casts added by type resolution
+  // are stripped before comparison. Two attributes are considered the same column if they share
+  // the same ExprId (exact reference) or the same name and dataType (resolved from same table).
+  private def computeAssignedAttrs(assignments: Seq[Assignment]): Seq[Attribute] = {
+    assignments.collect {
+      case Assignment(key: Attribute, value) if !isIdentityAssignment(key, value) => key
+    }
+  }
+
+  private def isIdentityAssignment(key: Attribute, value: Expression): Boolean = {
+    stripCasts(value) match {
+      case attr: Attribute => attr.exprId == key.exprId
+      case _ => false
+    }
+  }
+
+  private def stripCasts(expr: Expression): Expression = expr match {
+    case Cast(child, _, _, _) => stripCasts(child)
+    case Alias(child, _) => stripCasts(child)
+    case _ => expr
   }
 
   // this method assumes the assignments have been already aligned before

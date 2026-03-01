@@ -35,7 +35,7 @@ import org.apache.spark.sql.connector.catalog.constraints.Constraint
 import org.apache.spark.sql.connector.catalog.procedures.BoundProcedure
 import org.apache.spark.sql.connector.expressions.Transform
 import org.apache.spark.sql.connector.expressions.filter.Predicate
-import org.apache.spark.sql.connector.write.{DeltaWrite, RowLevelOperation, RowLevelOperationTable, SupportsDelta, Write}
+import org.apache.spark.sql.connector.write.{DeltaWrite, RowLevelOperation, RowLevelOperationTable, SupportsColumnUpdate, SupportsDelta, Write}
 import org.apache.spark.sql.connector.write.RowLevelOperation.Command.{DELETE, MERGE, UPDATE}
 import org.apache.spark.sql.errors.DataTypeErrors.toSQLType
 import org.apache.spark.sql.errors.QueryExecutionErrors
@@ -367,7 +367,17 @@ case class WriteDelta(
       case Some(projection) => DataTypeUtils.toAttributes(projection.schema)
       case None => Nil
     }
-    table.skipSchemaResolution || areCompatible(inRowAttrs, outRowAttrs)
+    if (table.skipSchemaResolution) return true
+    if (operation.isInstanceOf[SupportsColumnUpdate]) {
+      // for column-update connectors the row projection is a subset of the full table schema;
+      // verify that each projected field exists in the table schema and is type-compatible
+      inRowAttrs.forall { inAttr =>
+        outRowAttrs.find(outAttr => conf.resolver(inAttr.name, outAttr.name))
+          .exists(outAttr => areCompatible(Seq(inAttr), Seq(outAttr)))
+      }
+    } else {
+      areCompatible(inRowAttrs, outRowAttrs)
+    }
   }
 
   // validates row ID projection output is compatible with row ID attributes

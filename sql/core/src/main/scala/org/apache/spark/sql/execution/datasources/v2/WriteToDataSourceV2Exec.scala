@@ -692,10 +692,11 @@ case class DeltaWithMetadataWritingSparkTask(
           writer.delete(metadataProjection, rowIdProjection)
 
         case UPDATE_OPERATION =>
-          rowProjection.project(row)
+          if (rowProjection != null) rowProjection.project(row)
           rowIdProjection.project(row)
           metadataProjection.project(row)
-          writer.update(metadataProjection, rowIdProjection, rowProjection)
+          writer.update(metadataProjection, rowIdProjection,
+            if (rowProjection != null) rowProjection else InternalRow.empty)
 
         case REINSERT_OPERATION =>
           rowProjection.project(row)

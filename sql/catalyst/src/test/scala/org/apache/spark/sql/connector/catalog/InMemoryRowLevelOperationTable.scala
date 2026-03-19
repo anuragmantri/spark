@@ -60,6 +60,8 @@ class InMemoryRowLevelOperationTable(
   // used in row-level operation tests to verify passed records
   // (operation, id, metadata, row)
   var lastWriteLog: Seq[InternalRow] = Seq.empty
+  // used in column-update tests to verify the scan projection pushed down by Spark
+  var lastScanProjection: StructType = _
 
   override def newRowLevelOperationBuilder(
       info: RowLevelOperationInfo): RowLevelOperationBuilder = {
@@ -186,6 +188,17 @@ class InMemoryRowLevelOperationTable(
   class DeltaBasedColumnUpdateOperation(command: Command)
       extends DeltaBasedOperation(command) with SupportsColumnUpdate {
     override def representUpdateAsDeleteAndInsert(): Boolean = false
+
+    // Intercept pruneColumns to record what Spark actually pushes down to the scan,
+    // allowing tests to verify the scan projection is correctly narrowed.
+    override def newScanBuilder(options: CaseInsensitiveStringMap): ScanBuilder = {
+      new InMemoryScanBuilder(schema, options) {
+        override def pruneColumns(requiredSchema: StructType): Unit = {
+          lastScanProjection = requiredSchema
+          super.pruneColumns(requiredSchema)
+        }
+      }
+    }
 
     override protected def deltaBatchWrite(): DeltaBatchWrite =
       new RowLevelOperationBatchWrite with DeltaBatchWrite {

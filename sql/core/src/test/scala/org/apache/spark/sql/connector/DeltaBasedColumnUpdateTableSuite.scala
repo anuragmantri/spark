@@ -23,9 +23,12 @@ import org.apache.spark.sql.types.{IntegerType, StringType, StructField, StructT
 /**
  * Tests for UPDATE statements targeting connectors that implement SupportsColumnUpdate.
  *
- * When a connector implements SupportsColumnUpdate, Spark narrows the row projection
- * (LogicalWriteInfo.schema()) to contain only the assigned/changed columns rather than
- * the full table row.
+ * When a connector implements SupportsColumnUpdate, Spark:
+ *  1. Narrows the scan to only the columns needed to evaluate SET expressions and the
+ *     WHERE condition (plus rowId and metadata columns), so unneeded columns are never
+ *     read from the data files.
+ *  2. Narrows the row projection (LogicalWriteInfo.schema()) sent to the connector via
+ *     DeltaWriter.update to contain only the genuinely-changed (non-identity) columns.
  */
 class DeltaBasedColumnUpdateTableSuite extends RowLevelOperationSuiteBase {
 
@@ -35,7 +38,20 @@ class DeltaBasedColumnUpdateTableSuite extends RowLevelOperationSuiteBase {
     props
   }
 
-  // --- Schema narrowing: verify LogicalWriteInfo.schema() is narrow ---
+  /**
+   * Asserts that the scan projection pushed down to the connector by Spark's
+   * V2ScanRelationPushDown contains exactly the expected column names.
+   * The projection is recorded by DeltaBasedColumnUpdateOperation.newScanBuilder.
+   */
+  private def checkLastScanProjection(expectedColumnNames: Set[String]): Unit = {
+    val actual = table.lastScanProjection
+    assert(actual != null, "scan projection was not recorded; pruneColumns was never called")
+    assert(
+      actual.fieldNames.toSet == expectedColumnNames,
+      s"scan projection mismatch:\n  expected: $expectedColumnNames\n  actual:   ${actual.fieldNames.toSet}")
+  }
+
+  // --- Write schema narrowing: verify LogicalWriteInfo.schema() is narrow ---
 
   test("column-update: rowSchema contains only the single assigned column") {
     createAndInitTable("pk INT NOT NULL, id INT, dep STRING",
@@ -79,7 +95,7 @@ class DeltaBasedColumnUpdateTableSuite extends RowLevelOperationSuiteBase {
         |""".stripMargin)
 
     // Identity assignments: after alignUpdateAssignments, SET id=id, dep=dep produce
-    // Assignment(idAttr, idAttr) where value.semanticEquals(key) — filtered out
+    // Assignment(idAttr, idAttr) — stripped by isIdentityAssignment and excluded
     sql(s"UPDATE $tableNameAsString SET id = id, dep = dep WHERE pk = 1")
 
     checkLastWriteInfo(
@@ -128,6 +144,99 @@ class DeltaBasedColumnUpdateTableSuite extends RowLevelOperationSuiteBase {
       )),
       expectedRowIdSchema = Some(StructType(Array(PK_FIELD))),
       expectedMetadataSchema = Some(StructType(Array(PARTITION_FIELD, INDEX_FIELD_NULLABLE))))
+  }
+
+  // --- Scan projection narrowing: verify only needed columns are read from storage ---
+
+  test("column-update: scan excludes assignment-target column when SET uses a literal") {
+    createAndInitTable("pk INT NOT NULL, id INT, dep STRING",
+      """{ "pk": 1, "id": 1, "dep": "hr" }
+        |{ "pk": 2, "id": 2, "dep": "software" }
+        |{ "pk": 3, "id": 3, "dep": "hr" }
+        |""".stripMargin)
+
+    // SET id = -1: -1 is a literal; id is only the assignment target, not on the RHS.
+    // id does not need to be read from storage.
+    // dep must appear because it is the table partition column (needed for outputPartitioning).
+    sql(s"UPDATE $tableNameAsString SET id = -1 WHERE pk = 1")
+
+    checkLastScanProjection(Set("pk", "dep", "_partition"))
+
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString ORDER BY pk"),
+      Row(1, -1, "hr") :: Row(2, 2, "software") :: Row(3, 3, "hr") :: Nil)
+  }
+
+  test("column-update: scan projects column referenced in SET expression, excludes others") {
+    createAndInitTable("pk INT NOT NULL, salary INT, bonus INT, dep STRING",
+      """{ "pk": 1, "salary": 100, "bonus": 10, "dep": "hr" }
+        |{ "pk": 2, "salary": 200, "bonus": 20, "dep": "software" }
+        |{ "pk": 3, "salary": 300, "bonus": 30, "dep": "hr" }
+        |""".stripMargin)
+
+    // SET salary = salary * 2: salary is on the RHS and must be scanned.
+    // bonus is not referenced in the SET or WHERE and is not the partition column -- excluded.
+    sql(s"UPDATE $tableNameAsString SET salary = salary * 2")
+
+    checkLastScanProjection(Set("pk", "salary", "dep", "_partition"))
+
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString ORDER BY pk"),
+      Row(1, 200, 10, "hr") :: Row(2, 400, 20, "software") :: Row(3, 600, 30, "hr") :: Nil)
+  }
+
+  test("column-update: scan excludes LHS-only column for cross-column assignment") {
+    createAndInitTable("pk INT NOT NULL, x INT, y INT, dep STRING",
+      """{ "pk": 1, "x": 10, "y": 99, "dep": "hr" }
+        |{ "pk": 2, "x": 20, "y": 55, "dep": "software" }
+        |""".stripMargin)
+
+    // SET x = y: y is on the RHS and must be scanned; x is only the assignment target.
+    // x does not need to be read from storage -- its old value is irrelevant.
+    sql(s"UPDATE $tableNameAsString SET x = y WHERE pk = 1")
+
+    checkLastScanProjection(Set("pk", "y", "dep", "_partition"))
+
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString ORDER BY pk"),
+      Row(1, 99, 99, "hr") :: Row(2, 20, 55, "software") :: Nil)
+  }
+
+  test("column-update: scan excludes column not referenced in SET or WHERE") {
+    createAndInitTable("pk INT NOT NULL, id INT, dep STRING",
+      """{ "pk": 1, "id": 1, "dep": "hr" }
+        |{ "pk": 2, "id": 2, "dep": "software" }
+        |{ "pk": 3, "id": 3, "dep": "hr" }
+        |""".stripMargin)
+
+    // SET dep = 'engineering': dep is the assignment target and the partition column.
+    // WHERE pk IN (1, 3): references pk (also the rowId).
+    // id is not referenced anywhere and is not the partition column -- excluded.
+    sql(s"UPDATE $tableNameAsString SET dep = 'engineering' WHERE pk IN (1, 3)")
+
+    checkLastScanProjection(Set("pk", "dep", "_partition"))
+
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString ORDER BY pk"),
+      Row(1, 1, "engineering") :: Row(2, 2, "software") :: Row(3, 3, "engineering") :: Nil)
+  }
+
+  test("column-update: scan projects union of SET RHS and WHERE condition columns") {
+    createAndInitTable("pk INT NOT NULL, salary INT, bonus INT, dep STRING",
+      """{ "pk": 1, "salary": 100, "bonus": 10, "dep": "hr" }
+        |{ "pk": 2, "salary": 200, "bonus": 20, "dep": "software" }
+        |{ "pk": 3, "salary": 300, "bonus": 30, "dep": "hr" }
+        |""".stripMargin)
+
+    // SET salary = salary + bonus: both salary and bonus referenced on RHS.
+    // WHERE dep = 'hr': dep in condition AND is the partition column.
+    sql(s"UPDATE $tableNameAsString SET salary = salary + bonus WHERE dep = 'hr'")
+
+    checkLastScanProjection(Set("pk", "salary", "bonus", "dep", "_partition"))
+
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString ORDER BY pk"),
+      Row(1, 110, 10, "hr") :: Row(2, 200, 20, "software") :: Row(3, 330, 30, "hr") :: Nil)
   }
 
   // --- Data correctness: verify values are correctly written and merged ---
@@ -185,3 +294,4 @@ class DeltaBasedColumnUpdateTableSuite extends RowLevelOperationSuiteBase {
       Row(1, 99, 99, "hr") :: Row(2, 20, 99, "hr") :: Nil)
   }
 }
+

@@ -467,7 +467,17 @@ case class WriteDelta(
       case Some(projection) => DataTypeUtils.toAttributes(projection.schema)
       case None => Nil
     }
-    table.skipSchemaResolution || areCompatible(inRowAttrs, outRowAttrs)
+    if (table.skipSchemaResolution) return true
+    if (operation.supportsColumnUpdates()) {
+      // for column-update connectors the row projection is a subset of the full table schema;
+      // verify that each projected field exists in the table schema and is type-compatible
+      inRowAttrs.forall { inAttr =>
+        outRowAttrs.find(outAttr => conf.resolver(inAttr.name, outAttr.name))
+          .exists(outAttr => areCompatible(Seq(inAttr), Seq(outAttr)))
+      }
+    } else {
+      areCompatible(inRowAttrs, outRowAttrs)
+    }
   }
 
   // validates row ID projection output is compatible with row ID attributes

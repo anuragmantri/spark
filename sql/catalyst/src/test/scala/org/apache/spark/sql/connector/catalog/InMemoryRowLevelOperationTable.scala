@@ -51,6 +51,7 @@ class InMemoryRowLevelOperationTable(
   private final val INDEX_COLUMN_REF = FieldReference(IndexColumn.name)
   private final val SUPPORTS_DELTAS = "supports-deltas"
   private final val SPLIT_UPDATES = "split-updates"
+  private final val COLUMN_UPDATE = "column-update"
 
   // used in row-level operation tests to verify replaced partitions
   var replacedPartitions: Seq[Seq[Any]] = Seq.empty
@@ -62,7 +63,9 @@ class InMemoryRowLevelOperationTable(
 
   override def newRowLevelOperationBuilder(
       info: RowLevelOperationInfo): RowLevelOperationBuilder = {
-    if (properties.getOrDefault(SUPPORTS_DELTAS, "false") == "true") {
+    if (properties.getOrDefault(COLUMN_UPDATE, "false") == "true") {
+      () => new DeltaBasedColumnUpdateOperation(info.command)
+    } else if (properties.getOrDefault(SUPPORTS_DELTAS, "false") == "true") {
       () => DeltaBasedOperation(info.command)
     } else {
       () => PartitionBasedOperation(info.command)
@@ -172,6 +175,92 @@ class InMemoryRowLevelOperationTable(
 
     override def representUpdateAsDeleteAndInsert(): Boolean = {
       properties.getOrDefault(SPLIT_UPDATES, "false").toBoolean
+    }
+  }
+
+  // A delta-based operation that supports column-level updates: Spark sends only the
+  // assigned/changed columns in the row projection instead of the full row schema.
+  // representUpdateAsDeleteAndInsert must be false -- the split path requires a full row.
+  class DeltaBasedColumnUpdateOperation(command: Command)
+      extends DeltaBasedOperation(command) {
+    override def representUpdateAsDeleteAndInsert(): Boolean = false
+    override def supportsColumnUpdates(): Boolean = true
+
+    override def newWriteBuilder(info: LogicalWriteInfo): DeltaWriteBuilder = {
+      lastWriteInfo = info
+      new DeltaWriteBuilder {
+        override def build(): DeltaWrite =
+          new DeltaWrite with RequiresDistributionAndOrdering {
+
+            override def requiredDistribution(): Distribution = {
+              Distributions.clustered(Array(PARTITION_COLUMN_REF))
+            }
+
+            override def requiredOrdering(): Array[SortOrder] = {
+              Array[SortOrder](
+                LogicalExpressions.sort(
+                  PARTITION_COLUMN_REF,
+                  SortDirection.ASCENDING,
+                  SortDirection.ASCENDING.defaultNullOrdering())
+              )
+            }
+
+            override def toBatch: DeltaBatchWrite =
+              new RowLevelOperationBatchWrite with DeltaBatchWrite {
+                override def createBatchWriterFactory(
+                    info: PhysicalWriteInfo): DeltaWriterFactory = {
+                  new DeltaBufferedRowsWriterFactory(lastWriteInfo.schema())
+                }
+
+                // For column-update writes, rows in the buffer contain only the assigned columns
+                // (narrow schema from LogicalWriteInfo). We must expand each row to the full table
+                // schema before inserting into the in-memory table so that getKey() works
+                // correctly.
+                override def commit(messages: Array[WriterCommitMessage]): Unit =
+                  dataMap.synchronized {
+                    val newData = messages.map(_.asInstanceOf[BufferedRows])
+                    val writeSchema = lastWriteInfo.schema()
+                    val writeFieldIdx = writeSchema.fieldNames.zipWithIndex.toMap
+
+                    // For each updated row, read the existing full row from the dataMap by pk,
+                    // then overlay only the columns present in the narrow write schema.
+                    val mergedData = newData.map { buf =>
+                      val merged = new BufferedRows(buf.key, schema)
+                      val updateOpName = UTF8String.fromString(Update.toString)
+                      buf.log.foreach { logRow =>
+                        val opName = logRow.getUTF8String(0)
+                        if (opName == updateOpName) {
+                          val pk = logRow.getInt(1)
+                          val narrowRow = logRow.get(3, writeSchema).asInstanceOf[InternalRow]
+                          val baseRow = dataMap.values.iterator.flatten
+                            .flatMap(_.rows)
+                            .find(r => r.getInt(0) == pk)
+                          val fullRow = new GenericInternalRow(schema.length)
+                          baseRow.foreach { base =>
+                            for (i <- schema.fields.indices) {
+                              fullRow.update(i, base.get(i, schema(i).dataType))
+                            }
+                          }
+                          schema.fields.zipWithIndex.foreach { case (field, i) =>
+                            writeFieldIdx.get(field.name).foreach { j =>
+                              fullRow.update(i, narrowRow.get(j, field.dataType))
+                            }
+                          }
+                          merged.rows.append(fullRow)
+                        }
+                      }
+                      merged
+                    }
+
+                    withDeletes(newData)
+                    withData(mergedData)
+                    lastWriteLog = newData.flatMap(buffer => buffer.log).toIndexedSeq
+                  }
+
+                override def abort(messages: Array[WriterCommitMessage]): Unit = {}
+              }
+          }
+      }
     }
   }
 

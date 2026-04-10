@@ -45,4 +45,20 @@ public interface SupportsDelta extends RowLevelOperation {
   default boolean representUpdateAsDeleteAndInsert() {
     return false;
   }
+
+  /**
+   * Whether this delta connector supports receiving only the changed columns in
+   * {@link DeltaWriter#update} rather than a full row.
+   * <p>
+   * When true, Spark narrows the write schema reported via {@link LogicalWriteInfo#schema()} to
+   * contain only the assigned/changed columns, allowing the connector to identify which columns
+   * are present and write a column-level delta accordingly. When all SET assignments are identity
+   * assignments (SET col = col), Spark calls {@link DeltaWriter#update} with an empty row.
+   * <p>
+   * This method is ignored when {@link #representUpdateAsDeleteAndInsert()} returns {@code true},
+   * as the split delete-and-insert path requires a full row.
+   */
+  default boolean supportsColumnUpdates() {
+    return false;
+  }
 }

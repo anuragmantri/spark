@@ -660,9 +660,10 @@ case class DeltaWritingSparkTask(
           writer.delete(null, rowIdProjection)
 
         case UPDATE_OPERATION =>
-          rowProjection.project(row)
+          val updateRow = if (rowProjection != null) { rowProjection.project(row); rowProjection }
+            else InternalRow.empty
           rowIdProjection.project(row)
-          writer.update(null, rowIdProjection, rowProjection)
+          writer.update(null, rowIdProjection, updateRow)
 
         case REINSERT_OPERATION =>
           rowProjection.project(row)
@@ -699,10 +700,11 @@ case class DeltaWithMetadataWritingSparkTask(
           writer.delete(metadataProjection, rowIdProjection)
 
         case UPDATE_OPERATION =>
-          rowProjection.project(row)
+          val updateRow = if (rowProjection != null) { rowProjection.project(row); rowProjection }
+            else InternalRow.empty
           rowIdProjection.project(row)
           metadataProjection.project(row)
-          writer.update(metadataProjection, rowIdProjection, rowProjection)
+          writer.update(metadataProjection, rowIdProjection, updateRow)
 
         case REINSERT_OPERATION =>
           rowProjection.project(row)

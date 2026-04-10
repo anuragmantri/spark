@@ -17,7 +17,7 @@
 
 package org.apache.spark.sql.catalyst.analysis
 
-import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, AttributeReference, EqualNullSafe, Expression, If, Literal, MetadataAttribute, Not, SubqueryExpression}
+import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, AttributeReference, AttributeSet, Cast, EqualNullSafe, Expression, If, Literal, MetadataAttribute, Not, SubqueryExpression}
 import org.apache.spark.sql.catalyst.expressions.Literal.TrueLiteral
 import org.apache.spark.sql.catalyst.plans.logical.{Assignment, Expand, Filter, LogicalPlan, Project, ReplaceData, Union, UpdateTable, WriteDelta}
 import org.apache.spark.sql.catalyst.util.RowDeltaUtils._
@@ -154,9 +154,10 @@ object RewriteUpdateTable extends RewriteRowLevelCommand {
       cond: Expression): WriteDelta = {
 
     val operation = operationTable.operation.asInstanceOf[SupportsDelta]
+    val supportsColumnUpdate =
+      operation.supportsColumnUpdates() && !operation.representUpdateAsDeleteAndInsert
 
     // resolve all needed attrs (e.g. row ID and any required metadata attrs)
-    val rowAttrs = relation.output
     val rowIdAttrs = resolveRowIdAttrs(relation, operation)
     val metadataAttrs = resolveRequiredMetadataAttrs(relation, operation)
 
@@ -171,10 +172,43 @@ object RewriteUpdateTable extends RewriteRowLevelCommand {
       buildWriteDeltaUpdateProjection(matchedRowsPlan, assignments, rowIdAttrs)
     }
 
+    // when column update is supported, narrow rowAttrs to only the genuinely-assigned columns
+    // so LogicalWriteInfo.schema() carries a partial schema
+    val effectiveRowAttrs = if (supportsColumnUpdate) {
+      computeAssignedAttrs(assignments)
+    } else {
+      relation.output
+    }
+
     // build a plan to write the row delta to the table
     val writeRelation = relation.copy(table = operationTable)
-    val projections = buildWriteDeltaProjections(rowDeltaPlan, rowAttrs, rowIdAttrs, metadataAttrs)
+    val projections = buildWriteDeltaProjections(
+      rowDeltaPlan, effectiveRowAttrs, rowIdAttrs, metadataAttrs)
     WriteDelta(writeRelation, cond, rowDeltaPlan, relation, projections)
+  }
+
+  // Returns only the table attributes that are genuinely updated (changed) in this UPDATE.
+  // After alignUpdateAssignments, the value is always wrapped in Alias(...)(explicitMetadata)
+  // by TableOutputResolver.applyColumnMetadata, and may also be wrapped in Cast for type
+  // coercion. Strip these wrappers before comparing by exprId via AttributeSet.
+  private def computeAssignedAttrs(assignments: Seq[Assignment]): Seq[Attribute] = {
+    assignments.collect {
+      case Assignment(key: Attribute, value) if !isIdentityAssignment(key, value) => key
+    }
+  }
+
+  private def isIdentityAssignment(key: Attribute, value: Expression): Boolean = {
+    stripAliasesAndCasts(value) match {
+      case attr: Attribute => AttributeSet(Seq(key)).contains(attr)
+      case _ => false
+    }
+  }
+
+  // Recursively strips Alias and Cast wrappers introduced during assignment alignment.
+  private def stripAliasesAndCasts(expr: Expression): Expression = expr match {
+    case Alias(child, _) => stripAliasesAndCasts(child)
+    case Cast(child, _, _, _) => stripAliasesAndCasts(child)
+    case other => other
   }
 
   // this method assumes the assignments have been already aligned before

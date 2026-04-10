@@ -161,13 +161,22 @@ object RewriteUpdateTable extends RewriteRowLevelCommand {
     val rowIdAttrs = resolveRowIdAttrs(relation, operation)
     val metadataAttrs = resolveRequiredMetadataAttrs(relation, operation)
 
-    // construct a read relation and include all required metadata columns
-    val readRelation = buildRelationWithAttrs(relation, operationTable, metadataAttrs, rowIdAttrs)
+    // construct a read relation: narrow to required columns when column updates are supported,
+    // otherwise include all table columns
+    val readRelation = if (supportsColumnUpdate) {
+      buildNarrowReadRelation(
+        relation, operationTable, assignments, cond, rowIdAttrs, metadataAttrs,
+        operationTable.table.partitioning())
+    } else {
+      buildRelationWithAttrs(relation, operationTable, metadataAttrs, rowIdAttrs)
+    }
 
     // build a plan for updated records that match the condition
     val matchedRowsPlan = Filter(cond, readRelation)
     val rowDeltaPlan = if (operation.representUpdateAsDeleteAndInsert) {
       buildDeletesAndInserts(matchedRowsPlan, assignments, rowIdAttrs)
+    } else if (supportsColumnUpdate) {
+      buildColumnUpdateProjection(matchedRowsPlan, assignments, rowIdAttrs, metadataAttrs)
     } else {
       buildWriteDeltaUpdateProjection(matchedRowsPlan, assignments, rowIdAttrs)
     }
@@ -185,6 +194,83 @@ object RewriteUpdateTable extends RewriteRowLevelCommand {
     val projections = buildWriteDeltaProjections(
       rowDeltaPlan, effectiveRowAttrs, rowIdAttrs, metadataAttrs)
     WriteDelta(writeRelation, cond, rowDeltaPlan, relation, projections)
+  }
+
+  // Builds a narrow read relation that only scans the columns required for a column update:
+  // - attribute references from the RHS of non-identity assignments (to compute new values)
+  // - attributes referenced in the WHERE condition
+  // - row ID attributes (to identify the row for DeltaWriter#update)
+  // - required metadata attributes (for partition grouping/ordering)
+  // Uses AttributeSet for all set operations to avoid direct exprId comparisons.
+  private def buildNarrowReadRelation(
+      relation: DataSourceV2Relation,
+      operationTable: RowLevelOperationTable,
+      assignments: Seq[Assignment],
+      cond: Expression,
+      rowIdAttrs: Seq[AttributeReference],
+      metadataAttrs: Seq[AttributeReference],
+      partitioning: Array[org.apache.spark.sql.connector.expressions.Transform]
+      ): DataSourceV2Relation = {
+
+    val assignmentRhsAttrs = AttributeSet(assignments.collect {
+      case Assignment(key: Attribute, value) if !isIdentityAssignment(key, value) => value
+    })
+    val condAttrs = AttributeSet(Seq(cond))
+
+    // partition columns must be included so V2ScanPartitioningAndOrdering can resolve
+    // the partitioning expressions from the scan relation output
+    val partitioningAttrs = AttributeSet(
+      partitioning.flatMap { transform =>
+        transform.references().flatMap { ref =>
+          relation.output.find(attr => conf.resolver(attr.name, ref.describe()))
+        }
+      }
+    )
+
+    val required = assignmentRhsAttrs ++ condAttrs ++ AttributeSet(rowIdAttrs) ++ partitioningAttrs
+
+    // filter relation.output to only required data columns, preserving original order
+    val narrowOutput = relation.output.filter(required.contains)
+    relation.copy(
+      table = operationTable,
+      output = dedupAttrs(narrowOutput ++ rowIdAttrs ++ metadataAttrs))
+  }
+
+  // Builds the row delta projection for the column update path. Unlike
+  // buildWriteDeltaUpdateProjection (which is position-based and requires a full scan),
+  // this method works with a narrow scan by looking up columns by name.
+  private def buildColumnUpdateProjection(
+      plan: LogicalPlan,
+      assignments: Seq[Assignment],
+      rowIdAttrs: Seq[Attribute],
+      metadataAttrs: Seq[Attribute]): LogicalPlan = {
+
+    // only emit values for non-identity assignments (the narrow write schema)
+    val assignedValues = assignments.collect {
+      case Assignment(key: Attribute, value) if !isIdentityAssignment(key, value) =>
+        Alias(value, key.name)()
+    }
+
+    // pass through or null out metadata columns present in the narrow scan
+    val metadataAttrSet = AttributeSet(metadataAttrs)
+    val metadataValues = plan.output.filter(metadataAttrSet.contains).map { attr =>
+      if (MetadataAttribute.isPreservedOnUpdate(attr)) {
+        attr
+      } else {
+        Alias(Literal(null, attr.dataType), attr.name)(explicitMetadata = Some(attr.metadata))
+      }
+    }
+
+    // pass through row ID columns from the narrow scan
+    val rowIdAttrSet = AttributeSet(rowIdAttrs)
+    val rowIdValues = plan.output.filter(rowIdAttrSet.contains)
+
+    val originalRowIdValues = buildOriginalRowIdValues(rowIdAttrs, assignments)
+    val operationType = Alias(Literal(UPDATE_OPERATION), OPERATION_COLUMN)()
+
+    Project(
+      Seq(operationType) ++ assignedValues ++ metadataValues ++ rowIdValues ++ originalRowIdValues,
+      plan)
   }
 
   // Returns only the table attributes that are genuinely updated (changed) in this UPDATE.

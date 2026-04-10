@@ -203,4 +203,70 @@ class DeltaBasedColumnUpdateTableSuite extends RowLevelOperationSuiteBase {
       sql(s"SELECT * FROM $tableNameAsString ORDER BY pk"),
       Row(1, 1, "engineering") :: Row(2, 2, "software") :: Row(3, 3, "hr") :: Nil)
   }
+
+  // --- Scan narrowing: verify the connector only receives the columns it needs ---
+
+  test("column-update: scan excludes the assigned column when SET to a literal") {
+    createAndInitTable("pk INT NOT NULL, id INT, dep STRING",
+      """{ "pk": 1, "id": 1, "dep": "hr" }
+        |{ "pk": 2, "id": 2, "dep": "software" }
+        |""".stripMargin)
+
+    // id is the target of a literal assignment -- its current value is not needed for the scan.
+    // pk is needed for the WHERE condition and as rowId.
+    sql(s"UPDATE $tableNameAsString SET id = -1 WHERE pk = 1")
+
+    val scanSchema = table.lastScanSchema
+    assert(!scanSchema.fieldNames.contains("id"), s"id should be excluded from scan: $scanSchema")
+    assert(scanSchema.fieldNames.contains("pk"), s"pk must be in scan: $scanSchema")
+  }
+
+  test("column-update: scan includes the assigned column when its current value is the RHS") {
+    createAndInitTable("pk INT NOT NULL, salary INT, bonus INT, dep STRING",
+      """{ "pk": 1, "salary": 100, "bonus": 10, "dep": "hr" }
+        |{ "pk": 2, "salary": 200, "bonus": 20, "dep": "software" }
+        |""".stripMargin)
+
+    // salary appears on the RHS (salary * 2) so it must be scanned.
+    // bonus is not referenced anywhere -- excluded.
+    sql(s"UPDATE $tableNameAsString SET salary = salary * 2")
+
+    val scanSchema = table.lastScanSchema
+    assert(scanSchema.fieldNames.contains("salary"), s"salary must be in scan: $scanSchema")
+    assert(!scanSchema.fieldNames.contains("bonus"), s"bonus should be excluded: $scanSchema")
+  }
+
+  test("column-update: scan excludes non-referenced columns for literal assignment") {
+    createAndInitTable("pk INT NOT NULL, id INT, salary INT, dep STRING",
+      """{ "pk": 1, "id": 1, "salary": 100, "dep": "hr" }
+        |{ "pk": 2, "id": 2, "salary": 200, "dep": "software" }
+        |""".stripMargin)
+
+    // dep is a literal assignment; id and salary are not referenced -- only pk needed.
+    sql(s"UPDATE $tableNameAsString SET dep = 'engineering' WHERE pk = 1")
+
+    val scanSchema = table.lastScanSchema
+    assert(scanSchema.fieldNames.contains("pk"), s"pk must be in scan: $scanSchema")
+    assert(!scanSchema.fieldNames.contains("id"), s"id should be excluded: $scanSchema")
+    assert(!scanSchema.fieldNames.contains("salary"), s"salary should be excluded: $scanSchema")
+  }
+
+  test("column-update: scan includes condition columns even when not assigned") {
+    createAndInitTable("pk INT NOT NULL, salary INT, bonus INT, dep STRING",
+      """{ "pk": 1, "salary": 100, "bonus": 10, "dep": "hr" }
+        |{ "pk": 2, "salary": 200, "bonus": 20, "dep": "software" }
+        |""".stripMargin)
+
+    // dep appears in the WHERE clause -- must be scanned even though it is not assigned.
+    // bonus is neither assigned nor in the condition -- excluded.
+    // salary is set to a literal -- current value not needed.
+    sql(s"UPDATE $tableNameAsString SET salary = -1 WHERE dep = 'hr'")
+
+    val scanSchema = table.lastScanSchema
+    assert(scanSchema.fieldNames.contains("dep"),
+      s"dep must be in scan (WHERE clause): $scanSchema")
+    assert(!scanSchema.fieldNames.contains("bonus"), s"bonus should be excluded: $scanSchema")
+    assert(!scanSchema.fieldNames.contains("salary"),
+      s"salary should be excluded (literal assignment): $scanSchema")
+  }
 }

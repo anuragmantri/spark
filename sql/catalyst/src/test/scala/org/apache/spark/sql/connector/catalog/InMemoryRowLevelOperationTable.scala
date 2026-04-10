@@ -57,6 +57,8 @@ class InMemoryRowLevelOperationTable(
   var replacedPartitions: Seq[Seq[Any]] = Seq.empty
   // used in row-level operation tests to verify reported write schema
   var lastWriteInfo: LogicalWriteInfo = _
+  // used in column-update tests to verify the scan projection was narrowed correctly
+  var lastScanSchema: StructType = _
   // used in row-level operation tests to verify passed records
   // (operation, id, metadata, row)
   var lastWriteLog: Seq[InternalRow] = Seq.empty
@@ -185,6 +187,18 @@ class InMemoryRowLevelOperationTable(
       extends DeltaBasedOperation(command) {
     override def representUpdateAsDeleteAndInsert(): Boolean = false
     override def supportsColumnUpdates(): Boolean = true
+
+    // Override newScanBuilder to record the schema that Spark actually requests from the
+    // connector after column pruning, so tests can assert on scan narrowing.
+    override def newScanBuilder(options: CaseInsensitiveStringMap): ScanBuilder = {
+      new InMemoryScanBuilder(schema, options) {
+        override def build(): Scan = {
+          val scan = super.build()
+          lastScanSchema = scan.readSchema()
+          scan
+        }
+      }
+    }
 
     override def newWriteBuilder(info: LogicalWriteInfo): DeltaWriteBuilder = {
       lastWriteInfo = info

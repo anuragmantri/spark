@@ -231,6 +231,14 @@ trait RowLevelWrite extends V2WriteCommand with SupportsSubquery {
       operation.requiredMetadataAttributes.toImmutableArraySeq,
       originalTable)
   }
+
+  // Resolves the connector-declared data attributes against the original table.
+  // Symmetric with projectedMetadataAttrs; used in narrow-schema validation.
+  protected def projectedDataAttrs: Seq[Attribute] = {
+    V2ExpressionUtils.resolveRefs[AttributeReference](
+      operation.requiredDataAttributes.toImmutableArraySeq,
+      originalTable)
+  }
 }
 
 /**
@@ -280,7 +288,35 @@ case class ReplaceData(
   // validates row projection output is compatible with table attributes
   private def rowAttrsResolved: Boolean = {
     val inRowAttrs = DataTypeUtils.toAttributes(projections.rowProjection.schema)
-    table.skipSchemaResolution || areCompatible(inRowAttrs, table.output)
+    table.skipSchemaResolution ||
+      areCompatible(inRowAttrs, table.output) ||
+      dataAttrsResolved(inRowAttrs)
+  }
+
+  // Validates the narrow-write-schema row projection output.
+  //
+  // When the connector declares specific data attributes via requiredDataAttributes(), the
+  // write schema must exactly match projectedDataAttrs (same columns, same order).  This is
+  // symmetric with metadataAttrsResolved: the connector's declared attrs define the write schema.
+  //
+  // When requiredDataAttributes() is empty (heuristic path), the write schema contains only
+  // the assigned columns.  We validate each one exists in the table with a compatible type.
+  private def dataAttrsResolved(inRowAttrs: Seq[Attribute]): Boolean = {
+    if (!operation.supportsColumnUpdates()) { return false }
+    val outDataAttrs = projectedDataAttrs
+    if (outDataAttrs.nonEmpty) {
+      areCompatible(inRowAttrs, outDataAttrs)
+    } else {
+      inRowAttrs.forall { inAttr =>
+        table.output.exists { outAttr =>
+          val inType = CharVarcharUtils.getRawType(inAttr.metadata).getOrElse(inAttr.dataType)
+          val outType = CharVarcharUtils.getRawType(outAttr.metadata).getOrElse(outAttr.dataType)
+          inAttr.name == outAttr.name &&
+            DataType.equalsIgnoreCompatibleNullability(inType, outType) &&
+            (outAttr.nullable || !inAttr.nullable)
+        }
+      }
+    }
   }
 
   // validates metadata projection output is compatible with metadata attributes
@@ -366,7 +402,28 @@ case class WriteDelta(
       case Some(projection) => DataTypeUtils.toAttributes(projection.schema)
       case None => Nil
     }
-    table.skipSchemaResolution || areCompatible(inRowAttrs, outRowAttrs)
+    table.skipSchemaResolution ||
+      areCompatible(inRowAttrs, outRowAttrs) ||
+      dataAttrsResolved(inRowAttrs)
+  }
+
+  // Validates the narrow-write-schema row projection.  Symmetric with ReplaceData.
+  private def dataAttrsResolved(inRowAttrs: Seq[Attribute]): Boolean = {
+    if (!operation.supportsColumnUpdates()) { return false }
+    val outDataAttrs = projectedDataAttrs
+    if (outDataAttrs.nonEmpty) {
+      areCompatible(inRowAttrs, outDataAttrs)
+    } else {
+      inRowAttrs.forall { inAttr =>
+        table.output.exists { outAttr =>
+          val inType = CharVarcharUtils.getRawType(inAttr.metadata).getOrElse(inAttr.dataType)
+          val outType = CharVarcharUtils.getRawType(outAttr.metadata).getOrElse(outAttr.dataType)
+          inAttr.name == outAttr.name &&
+            DataType.equalsIgnoreCompatibleNullability(inType, outType) &&
+            (outAttr.nullable || !inAttr.nullable)
+        }
+      }
+    }
   }
 
   // validates row ID projection output is compatible with row ID attributes

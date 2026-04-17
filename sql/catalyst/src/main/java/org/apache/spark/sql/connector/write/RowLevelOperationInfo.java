@@ -18,6 +18,7 @@
 package org.apache.spark.sql.connector.write;
 
 import org.apache.spark.annotation.Experimental;
+import org.apache.spark.sql.connector.expressions.NamedReference;
 import org.apache.spark.sql.connector.write.RowLevelOperation.Command;
 import org.apache.spark.sql.util.CaseInsensitiveStringMap;
 
@@ -37,4 +38,20 @@ public interface RowLevelOperationInfo {
    * Returns the row-level SQL command (e.g. DELETE, UPDATE, MERGE).
    */
   Command command();
+
+  /**
+   * Returns the columns being updated in an UPDATE statement, as non-identity assignments.
+   *
+   * <p>For DELETE and MERGE, returns an empty array.
+   *
+   * <p>Connectors can use this to decide what {@link RowLevelOperation#requiredDataAttributes()}
+   * to declare. For instance, a connector that needs its primary key for row lookup can check
+   * whether pk is already in the updated columns list and, if not, add it to
+   * requiredDataAttributes().
+   *
+   * @since 4.2.0
+   */
+  default NamedReference[] updatedColumns() {
+    return new NamedReference[0];
+  }
 }

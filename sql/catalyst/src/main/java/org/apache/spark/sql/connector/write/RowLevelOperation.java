@@ -105,4 +105,40 @@ public interface RowLevelOperation {
   default NamedReference[] requiredMetadataAttributes() {
     return new NamedReference[0];
   }
+
+
+  /**
+   * Controls whether to send only the required data columns to the connector rather than the
+   * full row.
+   * <p>
+   * When true, Spark narrows {@link LogicalWriteInfo#schema()} to only the columns declared via
+   * {@link #requiredDataAttributes()} plus any columns assigned in the UPDATE statement
+   * (non-identity assignments).  Columns that are neither connector-declared nor assigned are
+   * excluded from both the scan and to write.
+   *
+   * @since 4.2.0
+   */
+  default boolean supportsColumnUpdates() {
+    return false;
+  }
+
+  /**
+   * Returns data column references required to perform this row-level operation.
+   *
+   * <p>This method is only consulted by Spark when {@link #supportsColumnUpdates()} returns
+   * {@code true}. If {@code supportsColumnUpdates()} returns {@code false}, the returned array
+   * is ignored and Spark reads all data columns (the default full-scan behavior).
+   *
+   * <p>When {@code supportsColumnUpdates()} is {@code true}, Spark narrows the scan to
+   * exactly these data columns plus mandatory columns:
+   *
+   * <p>Connectors typically use {@link RowLevelOperationInfo#updatedColumns()} to decide what
+   * extra columns to declare here. For example, a connector that needs its primary key for row
+   * lookup can check whether pk is already in {@code updatedColumns} and, if not, add it here.
+   *
+   * @since 4.2.0
+   */
+  default NamedReference[] requiredDataAttributes() {
+    return new NamedReference[0];
+  }
 }

@@ -221,6 +221,18 @@ abstract class RowLevelOperationSuiteBase
     assert(actualMetadataSchema == expectedMetadataSchema, "metadata schema must match")
   }
 
+  /**
+   * Asserts that the column names in RowLevelOperationInfo.updatedColumns() received by the
+   * last operation match exactly the expected set.  Order is ignored.
+   */
+  protected def checkLastUpdatedColumns(expectedNames: String*): Unit = {
+    val actual = table.lastUpdatedColumns.map(_.describe()).toSet
+    val expected = expectedNames.toSet
+    assert(actual == expected,
+      s"updatedColumns mismatch: expected ${expected.mkString("[", ", ", "]")} " +
+        s"but got ${actual.mkString("[", ", ", "]")}")
+  }
+
   protected def checkLastWriteLog(expectedEntries: WriteLogEntry*): Unit = {
     val entryType = new StructType()
       .add(StructField("operation", StringType))

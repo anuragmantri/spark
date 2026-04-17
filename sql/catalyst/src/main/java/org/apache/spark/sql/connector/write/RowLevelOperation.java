@@ -105,4 +105,45 @@ public interface RowLevelOperation {
   default NamedReference[] requiredMetadataAttributes() {
     return new NamedReference[0];
   }
+
+
+  /**
+   * Controls whether to send only the required data columns to the connector rather than the
+   * full row.
+   * <p>
+   * When true, Spark narrows the data column schema ({@link LogicalWriteInfo#schema()}) to only
+   * the columns declared via {@link #requiredDataAttributes()}. Metadata columns (from
+   * {@link #requiredMetadataAttributes()}) and row ID columns (from
+   * {@link SupportsDelta#rowId()}) are unaffected and always projected separately.
+   * <p>
+   * If {@link #requiredDataAttributes()} returns a non-empty array, the write schema is exactly
+   * those columns in declared order. The connector must include all columns it wants to receive,
+   * including the columns being updated. If {@link #requiredDataAttributes()} returns an empty
+   * array, Spark sends only the non-identity assigned columns (heuristic path).
+   *
+   * @since 4.2.0
+   */
+  default boolean supportsColumnUpdates() {
+    return false;
+  }
+
+  /**
+   * Returns data column references required to perform this row-level operation.
+   * <p>
+   * This method is only consulted by Spark when {@link #supportsColumnUpdates()} returns
+   * {@code true}. If {@code supportsColumnUpdates()} returns {@code false}, the returned array
+   * is ignored and the full table row is sent (the default behavior).
+   * <p>
+   * When non-empty, the returned columns become the write schema in declared order.
+   * The connector must declare all columns it wants to receive, including the columns being
+   * updated. Use {@link RowLevelOperationInfo#updatedColumns()} to learn which columns are being
+   * assigned, then add any extra columns needed for row lookup or routing (e.g., primary key).
+   * <p>
+   * When empty (the default), Spark falls back to sending only the non-identity assigned columns.
+   *
+   * @since 4.2.0
+   */
+  default NamedReference[] requiredDataAttributes() {
+    return new NamedReference[0];
+  }
 }

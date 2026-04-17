@@ -17,7 +17,6 @@
 
 package org.apache.spark.sql.execution.dynamicpruning
 
-import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeMap, AttributeReference, DynamicPruningExpression, Expression, InSubquery, ListQuery, PredicateHelper, V2ExpressionUtils}
 import org.apache.spark.sql.catalyst.expressions.Literal.TrueLiteral
 import org.apache.spark.sql.catalyst.optimizer.RewritePredicateSubquery
@@ -139,17 +138,13 @@ class RowLevelOperationRuntimeGroupFiltering(optimizeSubqueries: Rule[LogicalPla
       tableAttrs: Seq[Attribute],
       scanAttrs: Seq[Attribute]): AttributeMap[Attribute] = {
 
-    val attrMapping = tableAttrs.map { tableAttr =>
+    // For column-level updates, the scan may be narrowed to exclude columns that the
+    // connector does not need.  Skip table attributes that are absent from the scan
+    // instead of throwing -- they cannot appear in the condition if they were pruned.
+    val attrMapping = tableAttrs.flatMap { tableAttr =>
       scanAttrs
         .find(scanAttr => conf.resolver(scanAttr.name, tableAttr.name))
         .map(scanAttr => tableAttr -> scanAttr)
-        .getOrElse {
-          throw new AnalysisException(
-            errorClass = "_LEGACY_ERROR_TEMP_3075",
-            messageParameters = Map(
-              "tableAttr" -> tableAttr.toString,
-              "scanAttrs" -> scanAttrs.mkString(",")))
-        }
     }
     AttributeMap(attrMapping)
   }

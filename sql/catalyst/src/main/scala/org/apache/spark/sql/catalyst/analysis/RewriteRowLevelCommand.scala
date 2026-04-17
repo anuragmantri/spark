@@ -22,12 +22,13 @@ import scala.collection.mutable
 import org.apache.spark.SparkException
 import org.apache.spark.sql.catalyst.ProjectingInternalRow
 import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, AttributeReference, AttributeSet, Expression, ExprId, If, Literal, MetadataAttribute, NamedExpression, V2ExpressionUtils}
+import org.apache.spark.sql.catalyst.expressions.Literal.TrueLiteral
 import org.apache.spark.sql.catalyst.plans.logical.{Assignment, Expand, LogicalPlan, MergeRows, Project, Union}
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.util.{ReplaceDataProjections, WriteDeltaProjections}
 import org.apache.spark.sql.catalyst.util.RowDeltaUtils._
 import org.apache.spark.sql.connector.catalog.SupportsRowLevelOperations
-import org.apache.spark.sql.connector.expressions.FieldReference
+import org.apache.spark.sql.connector.expressions.{FieldReference, NamedReference}
 import org.apache.spark.sql.connector.write.{RowLevelOperation, RowLevelOperationInfoImpl, RowLevelOperationTable, SupportsDelta}
 import org.apache.spark.sql.connector.write.RowLevelOperation.Command
 import org.apache.spark.sql.errors.QueryCompilationErrors
@@ -50,20 +51,35 @@ trait RewriteRowLevelCommand extends Rule[LogicalPlan] {
   protected def buildOperationTable(
       table: SupportsRowLevelOperations,
       command: Command,
-      options: CaseInsensitiveStringMap): RowLevelOperationTable = {
-    val info = RowLevelOperationInfoImpl(command, options)
+      options: CaseInsensitiveStringMap,
+      updatedColumns: Seq[NamedReference] = Nil): RowLevelOperationTable = {
+    val info = RowLevelOperationInfoImpl(command, options, updatedColumns)
     val operation = table.newRowLevelOperationBuilder(info).build()
     RowLevelOperationTable(table, operation)
   }
 
+  // Builds a DataSourceV2Relation for a row-level operation, optionally narrowing its output.
+  //
+  // When dataAttrs is non-empty, the relation output is narrowed to include only columns
+  // required for a column-update write. When dataAttrs is empty, the full relation.output is
+  // preserved.
   protected def buildRelationWithAttrs(
       relation: DataSourceV2Relation,
       table: RowLevelOperationTable,
       metadataAttrs: Seq[AttributeReference],
-      rowIdAttrs: Seq[AttributeReference] = Nil): DataSourceV2Relation = {
+      rowIdAttrs: Seq[AttributeReference] = Nil,
+      dataAttrs: Seq[AttributeReference] = Nil,
+      cond: Expression = TrueLiteral): DataSourceV2Relation = {
 
-    val attrs = dedupAttrs(relation.output ++ rowIdAttrs ++ metadataAttrs)
-    relation.copy(table = table, output = attrs)
+    if (dataAttrs.nonEmpty) {
+      val required =
+        AttributeSet(dataAttrs) ++ AttributeSet(Seq(cond)) ++ AttributeSet(rowIdAttrs)
+      val narrowOutput = relation.output.filter(required.contains)
+      relation.copy(table = table, output = dedupAttrs(narrowOutput ++ rowIdAttrs ++ metadataAttrs))
+    } else {
+      val attrs = dedupAttrs(relation.output ++ rowIdAttrs ++ metadataAttrs)
+      relation.copy(table = table, output = attrs)
+    }
   }
 
   protected def dedupAttrs(attrs: Seq[AttributeReference]): Seq[AttributeReference] = {
@@ -84,6 +100,14 @@ trait RewriteRowLevelCommand extends Rule[LogicalPlan] {
 
     V2ExpressionUtils.resolveRefs[AttributeReference](
       operation.requiredMetadataAttributes.toImmutableArraySeq,
+      relation)
+  }
+
+  protected def resolveRequiredDataAttrs(
+      relation: DataSourceV2Relation,
+      operation: RowLevelOperation): Seq[AttributeReference] = {
+    V2ExpressionUtils.resolveRefs[AttributeReference](
+      operation.requiredDataAttributes.toImmutableArraySeq,
       relation)
   }
 
@@ -211,11 +235,13 @@ trait RewriteRowLevelCommand extends Rule[LogicalPlan] {
       metadataAttrs: Seq[Attribute]): WriteDeltaProjections = {
     val outputs = extractOutputs(plan)
 
+    // Always produce Some(rowProjection) even for empty rowAttrs (identity-only column updates).
+    // Physical execution calls rowProjection.project(row) unconditionally; None causes NPE.
     val rowProjection = if (rowAttrs.nonEmpty) {
       val outputsWithRow = filterOutputs(outputs, OPERATIONS_WITH_ROW)
       Some(newLazyProjection(plan, outputsWithRow, rowAttrs))
     } else {
-      None
+      Some(ProjectingInternalRow(StructType(Nil), Nil))
     }
 
     val outputsWithRowId = filterOutputs(outputs, OPERATIONS_WITH_ROW_ID)

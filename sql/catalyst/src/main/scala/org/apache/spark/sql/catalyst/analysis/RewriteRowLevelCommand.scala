@@ -72,9 +72,8 @@ trait RewriteRowLevelCommand extends Rule[LogicalPlan] {
       cond: Expression = TrueLiteral): DataSourceV2Relation = {
 
     if (dataAttrs.nonEmpty) {
-      val required =
-        AttributeSet(dataAttrs) ++ AttributeSet(Seq(cond)) ++ AttributeSet(rowIdAttrs)
-      val narrowOutput = relation.output.filter(required.contains)
+      val required = (dataAttrs ++ cond.references.toSeq).map(_.exprId).toSet
+      val narrowOutput = relation.output.filter(a => required.contains(a.exprId))
       relation.copy(table = table, output = dedupAttrs(narrowOutput ++ rowIdAttrs ++ metadataAttrs))
     } else {
       val attrs = dedupAttrs(relation.output ++ rowIdAttrs ++ metadataAttrs)

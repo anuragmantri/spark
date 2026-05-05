@@ -315,7 +315,7 @@ class InMemoryRowLevelOperationTable private (
                           val fullRow = new GenericInternalRow(schema.length)
                           baseRow.foreach { base =>
                             for (i <- schema.fields.indices) {
-                              fullRow.update(i, base.get(i, schema(i).dataType))
+                              fullRow.update(i, base.get(i, schema.fields(i).dataType))
                             }
                           }
                           schema.fields.zipWithIndex.foreach { case (field, i) =>
@@ -438,7 +438,7 @@ class InMemoryRowLevelOperationTable private (
                           val fullRow = new GenericInternalRow(schema.length)
                           baseRow.foreach { base =>
                             for (i <- schema.fields.indices) {
-                              fullRow.update(i, base.get(i, schema(i).dataType))
+                              fullRow.update(i, base.get(i, schema.fields(i).dataType))
                             }
                           }
                           schema.fields.zipWithIndex.foreach { case (field, i) =>
@@ -550,7 +550,7 @@ class InMemoryRowLevelOperationTable private (
           val fullRow = new GenericInternalRow(schema.length)
           origRow.foreach { base =>
             for (i <- schema.fields.indices) {
-              fullRow.update(i, base.get(i, schema(i).dataType))
+              fullRow.update(i, base.get(i, schema.fields(i).dataType))
             }
           }
           schema.fields.zipWithIndex.foreach { case (field, i) =>

@@ -17,7 +17,7 @@
 
 package org.apache.spark.sql.catalyst.analysis
 
-import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, AttributeMap, AttributeReference, AttributeSet, Cast, EqualNullSafe, Expression, If, Literal, MetadataAttribute, Not, SubqueryExpression}
+import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, AttributeMap, AttributeReference, AttributeSet, EqualNullSafe, Expression, If, Literal, MetadataAttribute, Not, SubqueryExpression}
 import org.apache.spark.sql.catalyst.expressions.Literal.TrueLiteral
 import org.apache.spark.sql.catalyst.plans.logical.{Assignment, Expand, Filter, LogicalPlan, Project, ReplaceData, Union, UpdateTable, WriteDelta}
 import org.apache.spark.sql.catalyst.util.RowDeltaUtils._
@@ -328,8 +328,6 @@ object RewriteUpdateTable extends RewriteRowLevelCommand {
   }
 
   // Returns the table attributes that are genuinely updated (non-identity) in this UPDATE.
-  // Strips Alias/Cast wrappers introduced during assignment alignment before doing the
-  // AttributeSet membership check (which uses exprId equality internally).
   private def computeAssignedAttrs(assignments: Seq[Assignment]): Seq[AttributeReference] = {
     assignments.collect {
       case Assignment(key: AttributeReference, value) if !isIdentityAssignment(key, value) => key
@@ -337,17 +335,14 @@ object RewriteUpdateTable extends RewriteRowLevelCommand {
   }
 
   private def isIdentityAssignment(key: Attribute, value: Expression): Boolean = {
-    stripAliasesAndCasts(value) match {
+    val unwrapped = value match {
+      case Alias(child, _) => child
+      case other => other
+    }
+    unwrapped match {
       case attr: Attribute => AttributeSet(Seq(key)).contains(attr)
       case _ => false
     }
-  }
-
-  // Recursively strips Alias and Cast wrappers introduced during assignment alignment.
-  private def stripAliasesAndCasts(expr: Expression): Expression = expr match {
-    case Alias(child, _) => stripAliasesAndCasts(child)
-    case Cast(child, _, _, _) => stripAliasesAndCasts(child)
-    case other => other
   }
 
   // this method assumes the assignments have been already aligned before

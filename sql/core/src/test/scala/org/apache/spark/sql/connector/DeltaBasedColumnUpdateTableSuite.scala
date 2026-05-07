@@ -428,9 +428,12 @@ class DeltaBasedColumnUpdateTableSuite extends RowLevelOperationSuiteBase {
     sql(s"UPDATE $tableNameAsString SET salary = -1 WHERE pk = 1")
 
     val writeSchema = table.lastWriteInfo.schema()
-    assert(writeSchema.fieldNames.contains("salary"), s"salary must be in write schema: $writeSchema")
-    assert(writeSchema.fieldNames.contains("pk"), s"pk must be in write schema: $writeSchema")
-    assert(!writeSchema.fieldNames.contains("id"), s"id must not be in write schema: $writeSchema")
+    assert(writeSchema.fieldNames.contains("salary"),
+      s"salary must be in write schema: $writeSchema")
+    assert(writeSchema.fieldNames.contains("pk"),
+      s"pk must be in write schema: $writeSchema")
+    assert(!writeSchema.fieldNames.contains("id"),
+      s"id must not be in write schema: $writeSchema")
     assert(!writeSchema.fieldNames.contains("dep"),
       s"dep must not be in write schema: $writeSchema")
   }

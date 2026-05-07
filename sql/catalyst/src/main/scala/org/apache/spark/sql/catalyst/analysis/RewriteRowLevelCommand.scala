@@ -58,11 +58,13 @@ trait RewriteRowLevelCommand extends Rule[LogicalPlan] {
     RowLevelOperationTable(table, operation)
   }
 
-  // Builds a DataSourceV2Relation for a row-level operation, optionally narrowing its output.
-  //
-  // When dataAttrs is non-empty, the relation output is narrowed to include only columns
-  // required for a column-update write. When dataAttrs is empty, the full relation.output is
-  // preserved.
+  /**
+   * Builds a DataSourceV2Relation for a row-level operation, optionally narrowing its output.
+   *
+   * When dataAttrs is non-empty, the relation output is narrowed to include only columns
+   * required for a column-update write. When dataAttrs is empty, the full relation.output is
+   * preserved.
+   */
   protected def buildRelationWithAttrs(
       relation: DataSourceV2Relation,
       table: RowLevelOperationTable,

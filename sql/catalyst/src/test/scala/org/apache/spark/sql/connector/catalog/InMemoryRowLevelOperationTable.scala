@@ -73,17 +73,8 @@ class InMemoryRowLevelOperationTable private (
   private final val noMetadata = properties.getOrDefault(NO_METADATA, "false") == "true"
   private final val COLUMN_UPDATE = "column-update"
   private final val COLUMN_UPDATE_REQ_ATTRS = "column-update-req-attrs"
-  // Selects PartitionBasedColumnUpdateOperation: CoW connector with supportsColumnUpdates=true
-  // and requiredDataAttributes=[pk,dep].
   private final val COLUMN_UPDATE_COW = "column-update-cow"
-  // Selects DeltaBasedColumnUpdateOperationFromInfo: connector that derives
-  // requiredDataAttributes() dynamically from RowLevelOperationInfo.updatedColumns().
-  // Always adds "pk" for row lookup plus whatever Spark reports as updated.
   private final val COLUMN_UPDATE_FROM_INFO = "column-update-from-info"
-  // Selects DeltaBasedColumnUpdateSplitOperation: delta connector with
-  // representUpdateAsDeleteAndInsert=true AND supportsColumnUpdates=true.
-  // Used to verify Point 7: the restriction on column updates for the delete+reinsert path
-  // has been lifted.
   private final val COLUMN_UPDATE_SPLIT = "column-update-split"
 
   // used in row-level operation tests to verify replaced partitions
@@ -341,23 +332,11 @@ class InMemoryRowLevelOperationTable private (
     }
   }
 
-  // A variant of DeltaBasedColumnUpdateOperation that overrides requiredDataAttributes()
-  // to declare a fixed set of data columns the connector needs in the scan.  This exercises
-  // the connector-driven scan-narrowing path (as opposed to the heuristic path).
   class DeltaBasedColumnUpdateOperationWithReqAttrs(command: Command, reqCols: Array[String])
       extends DeltaBasedColumnUpdateOperation(command) {
     override def requiredDataAttributes(): Array[NamedReference] = reqCols.map(FieldReference(_))
   }
 
-  // A delta-based column-update connector that derives requiredDataAttributes() dynamically
-  // from RowLevelOperationInfo.updatedColumns().
-  //
-  // This models the common connector pattern:
-  //   1. Spark tells the connector which columns are being updated via updatedColumns().
-  //   2. The connector adds any extra columns it always needs (here: "pk" for row lookup).
-  //   3. The combined set is returned from requiredDataAttributes() so Spark narrows the scan.
-  //
-  // If "pk" is already in updatedColumns (the user is updating pk itself), it is not duplicated.
   class DeltaBasedColumnUpdateOperationFromInfo(
       command: Command,
       updatedCols: Seq[NamedReference])
@@ -375,13 +354,6 @@ class InMemoryRowLevelOperationTable private (
     }
   }
 
-  // A delta-based operation that combines representUpdateAsDeleteAndInsert=true with
-  // supportsColumnUpdates()=true.  This verifies that the restriction which previously
-  // blocked column-level updates on the delete+reinsert path has been lifted.
-  //
-  // The connector declares "pk" plus any columns being updated (via updatedCols).
-  // The write schema = requiredDataAttributes() in declared order.
-  // The REINSERT leg receives the narrow write row; the DELETE leg uses row ID only.
   class DeltaBasedColumnUpdateSplitOperation(
       command: Command,
       updatedCols: Seq[NamedReference] = Nil)
@@ -464,11 +436,6 @@ class InMemoryRowLevelOperationTable private (
     }
   }
 
-  // A CoW operation that supports column-level updates.  The connector declares it needs
-  // "pk" and "dep" for partition routing, plus any columns the user is updating (via
-  // updatedCols from RowLevelOperationInfo).  supportsColumnUpdates()=true so Spark narrows
-  // the scan and write schema to exactly requiredDataAttributes().
-  // The commit logic reconstructs full rows from the original scan data using pk as a key.
   class PartitionBasedColumnUpdateOperation(
       command: Command,
       updatedCols: Seq[NamedReference] = Nil) extends RowLevelOperation {
@@ -479,8 +446,6 @@ class InMemoryRowLevelOperationTable private (
     override def supportsColumnUpdates(): Boolean = true
 
     override def requiredDataAttributes(): Array[NamedReference] = {
-      // Always need pk (for row lookup) and dep (partition key).
-      // Also include any columns being updated so Spark sends their new values.
       val base = Seq(FieldReference("pk"), FieldReference("dep"))
       val baseNames = base.map(_.describe()).toSet
       (base ++ updatedCols.filterNot(r => baseNames.contains(r.describe()))).toArray

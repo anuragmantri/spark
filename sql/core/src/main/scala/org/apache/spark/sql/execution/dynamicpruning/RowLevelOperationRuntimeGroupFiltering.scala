@@ -138,9 +138,9 @@ class RowLevelOperationRuntimeGroupFiltering(optimizeSubqueries: Rule[LogicalPla
       tableAttrs: Seq[Attribute],
       scanAttrs: Seq[Attribute]): AttributeMap[Attribute] = {
 
-    // For column-level updates, the scan may be narrowed to exclude columns that the
-    // connector does not need.  Skip table attributes that are absent from the scan
-    // instead of throwing -- they cannot appear in the condition if they were pruned.
+    // The scan may be narrowed to exclude columns not needed by the connector.
+    // Attributes absent from the scan are skipped here; the caller must ensure
+    // that any attribute referenced in the condition is present in the scan.
     val attrMapping = tableAttrs.flatMap { tableAttr =>
       scanAttrs
         .find(scanAttr => conf.resolver(scanAttr.name, tableAttr.name))

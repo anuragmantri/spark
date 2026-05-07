@@ -39,8 +39,6 @@ class DeltaBasedColumnUpdateTableSuite extends RowLevelOperationSuiteBase {
     props
   }
 
-  // --- Schema narrowing: verify LogicalWriteInfo.schema() is narrow ---
-
   test("column-update: rowSchema contains only the single assigned column") {
     createAndInitTable("pk INT NOT NULL, id INT, dep STRING",
       """{ "pk": 1, "id": 1, "dep": "hr" }
@@ -50,7 +48,6 @@ class DeltaBasedColumnUpdateTableSuite extends RowLevelOperationSuiteBase {
 
     sql(s"UPDATE $tableNameAsString SET id = -1 WHERE pk = 1")
 
-    // Only the assigned column (id) should appear in the row schema -- not pk or dep
     checkLastWriteInfo(
       expectedRowSchema = StructType(Seq(
         StructField("id", IntegerType, nullable = false)
@@ -67,7 +64,6 @@ class DeltaBasedColumnUpdateTableSuite extends RowLevelOperationSuiteBase {
 
     sql(s"UPDATE $tableNameAsString SET id = -1, dep = 'engineering' WHERE pk = 1")
 
-    // Both assigned columns (id, dep) should appear -- but NOT pk (unassigned)
     checkLastWriteInfo(
       expectedRowSchema = StructType(Seq(
         StructField("id", IntegerType, nullable = false),
@@ -124,16 +120,12 @@ class DeltaBasedColumnUpdateTableSuite extends RowLevelOperationSuiteBase {
       expectedMetadataSchema = Some(StructType(Array(PARTITION_FIELD, INDEX_FIELD_NULLABLE))))
   }
 
-  // --- Identity assignment filtering ---
-
   test("column-update: rowSchema excludes identity assignments in a mixed UPDATE") {
     createAndInitTable("pk INT NOT NULL, id INT, dep STRING",
       """{ "pk": 1, "id": 1, "dep": "hr" }
         |{ "pk": 2, "id": 2, "dep": "software" }
         |""".stripMargin)
 
-    // id = id is identity -- should be excluded from rowSchema
-    // dep = 'engineering' is a real assignment -- should be included
     sql(s"UPDATE $tableNameAsString SET id = id, dep = 'engineering' WHERE pk = 1")
 
     checkLastWriteInfo(
@@ -150,7 +142,6 @@ class DeltaBasedColumnUpdateTableSuite extends RowLevelOperationSuiteBase {
         |{ "pk": 2, "id": 2, "dep": "software" }
         |""".stripMargin)
 
-    // dep = dep is identity; id = -1 is a real assignment -- only id should appear
     sql(s"UPDATE $tableNameAsString SET dep = dep, id = -1 WHERE pk = 1")
 
     checkLastWriteInfo(
@@ -161,7 +152,23 @@ class DeltaBasedColumnUpdateTableSuite extends RowLevelOperationSuiteBase {
       expectedMetadataSchema = Some(StructType(Array(PARTITION_FIELD, INDEX_FIELD_NULLABLE))))
   }
 
-  // --- updatedColumns in RowLevelOperationInfo ---
+  test("column-update: nested struct field update narrows to the root struct column") {
+    createAndInitTable("pk INT NOT NULL, s STRUCT<c1: INT, c2: INT>, dep STRING",
+      """{ "pk": 1, "s": { "c1": 1, "c2": 2 }, "dep": "hr" }
+        |""".stripMargin)
+
+    sql(s"UPDATE $tableNameAsString SET s.c1 = -1 WHERE pk = 1")
+
+    val updatedNames = table.lastUpdatedColumns.map(_.describe()).toSet
+    assert(updatedNames == Set("s"),
+      s"expected [s] in updatedColumns (root struct) but got: $updatedNames")
+
+    val writeSchema = table.lastWriteInfo.schema()
+    assert(writeSchema.fieldNames.contains("s"),
+      s"s must be in write schema: $writeSchema")
+    assert(!writeSchema.fieldNames.contains("dep"),
+      s"dep must not be in write schema: $writeSchema")
+  }
 
   test("column-update: updatedColumns contains non-identity assigned columns") {
     createAndInitTable("pk INT NOT NULL, id INT, dep STRING",
@@ -180,7 +187,6 @@ class DeltaBasedColumnUpdateTableSuite extends RowLevelOperationSuiteBase {
       """{ "pk": 1, "id": 1, "dep": "hr" }
         |""".stripMargin)
 
-    // dep = dep is identity; only id should appear in updatedColumns
     sql(s"UPDATE $tableNameAsString SET id = -1, dep = dep WHERE pk = 1")
 
     val updatedNames = table.lastUpdatedColumns.map(_.describe()).toSet
@@ -200,9 +206,6 @@ class DeltaBasedColumnUpdateTableSuite extends RowLevelOperationSuiteBase {
   }
 
   test("column-update: updatedColumns is empty for DELETE (Javadoc contract)") {
-    // DELETE never has updated columns -- verify that the default empty array is passed
-    // through RowLevelOperationInfo even when a column-update connector handles the DELETE.
-    // Use a partition-column condition so the InMemory table can process the filter.
     createAndInitTable("pk INT NOT NULL, id INT, dep STRING",
       """{ "pk": 1, "id": 1, "dep": "hr" }
         |{ "pk": 2, "id": 2, "dep": "software" }
@@ -213,8 +216,6 @@ class DeltaBasedColumnUpdateTableSuite extends RowLevelOperationSuiteBase {
     assert(table.lastUpdatedColumns.isEmpty,
       s"DELETE must pass empty updatedColumns but got: ${table.lastUpdatedColumns.mkString(", ")}")
   }
-
-  // --- Data correctness ---
 
   test("column-update: data correctness -- single column update") {
     createAndInitTable("pk INT NOT NULL, id INT, dep STRING",
@@ -251,7 +252,6 @@ class DeltaBasedColumnUpdateTableSuite extends RowLevelOperationSuiteBase {
         |{ "pk": 3, "id": 3, "dep": "hr" }
         |""".stripMargin)
 
-    // Only dep changes; id stays as-is even though id = id is in the SET list.
     sql(s"UPDATE $tableNameAsString SET id = id, dep = 'engineering' WHERE pk = 1")
 
     checkAnswer(
@@ -259,16 +259,12 @@ class DeltaBasedColumnUpdateTableSuite extends RowLevelOperationSuiteBase {
       Row(1, 1, "engineering") :: Row(2, 2, "software") :: Row(3, 3, "hr") :: Nil)
   }
 
-  // --- Scan narrowing: verify the connector only receives the columns it needs ---
-
   test("column-update: scan excludes the assigned column when SET to a literal") {
     createAndInitTable("pk INT NOT NULL, id INT, dep STRING",
       """{ "pk": 1, "id": 1, "dep": "hr" }
         |{ "pk": 2, "id": 2, "dep": "software" }
         |""".stripMargin)
 
-    // id is the target of a literal assignment -- its current value is not needed.
-    // pk is needed for the WHERE condition and as rowId.
     sql(s"UPDATE $tableNameAsString SET id = -1 WHERE pk = 1")
 
     val scanSchema = table.lastScanSchema
@@ -282,8 +278,6 @@ class DeltaBasedColumnUpdateTableSuite extends RowLevelOperationSuiteBase {
         |{ "pk": 2, "salary": 200, "bonus": 20, "dep": "software" }
         |""".stripMargin)
 
-    // salary appears on the RHS (salary * 2) so it must be scanned.
-    // bonus is not referenced anywhere -- excluded.
     sql(s"UPDATE $tableNameAsString SET salary = salary * 2")
 
     val scanSchema = table.lastScanSchema
@@ -297,7 +291,6 @@ class DeltaBasedColumnUpdateTableSuite extends RowLevelOperationSuiteBase {
         |{ "pk": 2, "id": 2, "salary": 200, "dep": "software" }
         |""".stripMargin)
 
-    // dep is a literal assignment; id and salary are not referenced -- only pk needed.
     sql(s"UPDATE $tableNameAsString SET dep = 'engineering' WHERE pk = 1")
 
     val scanSchema = table.lastScanSchema
@@ -312,9 +305,7 @@ class DeltaBasedColumnUpdateTableSuite extends RowLevelOperationSuiteBase {
         |{ "pk": 2, "salary": 200, "bonus": 20, "dep": "software" }
         |""".stripMargin)
 
-    // dep appears in the WHERE clause -- must be scanned even though it is not assigned.
-    // bonus is neither assigned nor in the condition -- excluded.
-    // salary is set to a literal -- current value not needed.
+    // dep is in WHERE but not assigned -- must still be scanned
     sql(s"UPDATE $tableNameAsString SET salary = -1 WHERE dep = 'hr'")
 
     val scanSchema = table.lastScanSchema
@@ -325,12 +316,6 @@ class DeltaBasedColumnUpdateTableSuite extends RowLevelOperationSuiteBase {
       s"salary should be excluded (literal assignment): $scanSchema")
   }
 
-  // ---------------------------------------------------------------------------
-  // Connector-driven scan narrowing via requiredDataAttributes()
-  // ---------------------------------------------------------------------------
-
-  // Creates a table backed by DeltaBasedColumnUpdateOperationWithReqAttrs, which overrides
-  // requiredDataAttributes() to return the given comma-separated column names.
   private def createAndInitTableWithReqAttrs(
       reqAttrs: String,
       schemaString: String,
@@ -349,10 +334,6 @@ class DeltaBasedColumnUpdateTableSuite extends RowLevelOperationSuiteBase {
   }
 
   test("column-update: requiredDataAttributes forces connector-declared column into scan") {
-    // Connector declares it always needs "dep".
-    // SQL assigns "id" (literal) with condition on "pk".
-    // Connector-driven scan = {pk, dep} (dep from connector declaration; pk from condition).
-    // id is NOT in scan: literal assignment + not declared by connector.
     createAndInitTableWithReqAttrs("dep", "pk INT NOT NULL, id INT, dep STRING",
       """{ "pk": 1, "id": 1, "dep": "hr" }
         |{ "pk": 2, "id": 2, "dep": "software" }
@@ -365,12 +346,10 @@ class DeltaBasedColumnUpdateTableSuite extends RowLevelOperationSuiteBase {
       s"dep must be in scan (connector required): $scanSchema")
     assert(scanSchema.fieldNames.contains("pk"), s"pk must be in scan: $scanSchema")
     assert(!scanSchema.fieldNames.contains("id"),
-      s"id should be excluded (literal assignment, not declared): $scanSchema")
+      s"id should be excluded (literal, not declared): $scanSchema")
   }
 
   test("column-update: requiredDataAttributes - data correctness") {
-    // Connector declares "dep,id" so it receives both the new id value and dep for routing.
-    // The write schema is exactly requiredDataAttributes = {dep, id} (declared order).
     createAndInitTableWithReqAttrs("dep,id", "pk INT NOT NULL, id INT, dep STRING",
       """{ "pk": 1, "id": 1, "dep": "hr" }
         |{ "pk": 2, "id": 2, "dep": "software" }
@@ -385,13 +364,6 @@ class DeltaBasedColumnUpdateTableSuite extends RowLevelOperationSuiteBase {
   }
 
   test("column-update: empty requiredDataAttributes falls back to heuristic") {
-    // "column-update" uses DeltaBasedColumnUpdateOperation whose requiredDataAttributes()
-    // returns the default empty array.
-    // With the optimizer-driven approach for MOR, the scan is narrowed by V2ScanRelationPushDown
-    // which observes what columns the write plan actually references.
-    // SET id = -1 (literal assignment): id is not referenced from the scan, so it is pruned.
-    // dep is the partitioning column; since it is not declared in requiredDataAttributes()
-    // and is not referenced by the WHERE condition (pk = 1), it may be pruned from the scan.
     createAndInitTable("pk INT NOT NULL, id INT, dep STRING",
       """{ "pk": 1, "id": 1, "dep": "hr" }
         |{ "pk": 2, "id": 2, "dep": "software" }
@@ -401,16 +373,21 @@ class DeltaBasedColumnUpdateTableSuite extends RowLevelOperationSuiteBase {
 
     val scanSchema = table.lastScanSchema
     assert(!scanSchema.fieldNames.contains("id"),
-      s"id must NOT be in scan (literal assignment, no scan reference): $scanSchema")
+      s"id must NOT be in scan (literal assignment): $scanSchema")
     assert(scanSchema.fieldNames.contains("pk"), s"pk must be in scan (condition): $scanSchema")
   }
 
-  // ---------------------------------------------------------------------------
-  // Connector uses RowLevelOperationInfo.updatedColumns() to derive its own
-  // requiredDataAttributes() dynamically.
-  // DeltaBasedColumnUpdateOperationFromInfo always adds "pk" (for row lookup) to
-  // whatever Spark reports as updated columns.
-  // ---------------------------------------------------------------------------
+  test("column-update: requiredDataAttributes throws AnalysisException for invalid column") {
+    createAndInitTableWithReqAttrs("nonexistent_col", "pk INT NOT NULL, id INT, dep STRING",
+      """{ "pk": 1, "id": 1, "dep": "hr" }
+        |""".stripMargin)
+
+    val ex = intercept[org.apache.spark.sql.AnalysisException] {
+      sql(s"UPDATE $tableNameAsString SET id = -1 WHERE pk = 1")
+    }
+    assert(ex.getMessage.contains("nonexistent_col"),
+      s"Expected error about unresolvable column but got: ${ex.getMessage}")
+  }
 
   private def createAndInitTableFromInfo(schemaString: String, jsonData: String): Unit = {
     val props = new java.util.HashMap[String, String]()
@@ -427,16 +404,6 @@ class DeltaBasedColumnUpdateTableSuite extends RowLevelOperationSuiteBase {
   }
 
   test("column-update from-info: connector adds pk to updatedColumns for requiredDataAttributes") {
-    // Connector receives updatedColumns=[salary], adds pk for row lookup.
-    // requiredDataAttributes() = [pk, salary].
-    //
-    // salary = -1 is a LITERAL assignment: the write plan references Literal(-1) not the
-    // scan's salary column.  Since salary is in assignedAttrs, it is not a connectorExtraAttr
-    // pass-through either.  V2ScanRelationPushDown therefore does not see salary referenced
-    // and prunes it from the scan.
-    //
-    // The scan contains: pk (connector pass-through), dep (partitioning + WHERE condition).
-    // The scan excludes: salary (literal assignment), id and bonus (not declared, not in cond).
     createAndInitTableFromInfo("pk INT NOT NULL, salary INT, id INT, bonus INT, dep STRING",
       """{ "pk": 1, "salary": 100, "id": 10, "bonus": 5, "dep": "hr" }
         |{ "pk": 2, "salary": 200, "id": 20, "bonus": 6, "dep": "software" }
@@ -446,19 +413,13 @@ class DeltaBasedColumnUpdateTableSuite extends RowLevelOperationSuiteBase {
     sql(s"UPDATE $tableNameAsString SET salary = -1 WHERE dep = 'hr'")
 
     val scanSchema = table.lastScanSchema
-    assert(scanSchema.fieldNames.contains("pk"),
-      s"pk must be in scan (connector pass-through via connectorExtraAttrs): $scanSchema")
-    assert(scanSchema.fieldNames.contains("dep"),
-      s"dep must be in scan (partitioning + WHERE): $scanSchema")
-    assert(!scanSchema.fieldNames.contains("id"),
-      s"id must be excluded (not declared, not assigned, not in condition): $scanSchema")
-    assert(!scanSchema.fieldNames.contains("bonus"),
-      s"bonus must be excluded (not declared, not assigned, not in condition): $scanSchema")
+    assert(scanSchema.fieldNames.contains("pk"), s"pk must be in scan: $scanSchema")
+    assert(scanSchema.fieldNames.contains("dep"), s"dep must be in scan (WHERE): $scanSchema")
+    assert(!scanSchema.fieldNames.contains("id"), s"id must be excluded: $scanSchema")
+    assert(!scanSchema.fieldNames.contains("bonus"), s"bonus must be excluded: $scanSchema")
   }
 
   test("column-update from-info: write schema is updatedColumns + pk pass-through") {
-    // requiredDataAttributes = [pk, salary] (pk always added; salary because it's assigned).
-    // Write schema = requiredDataAttributes in declared order = {pk, salary}.
     createAndInitTableFromInfo("pk INT NOT NULL, salary INT, id INT, dep STRING",
       """{ "pk": 1, "salary": 100, "id": 10, "dep": "hr" }
         |{ "pk": 2, "salary": 200, "id": 20, "dep": "software" }
@@ -467,20 +428,14 @@ class DeltaBasedColumnUpdateTableSuite extends RowLevelOperationSuiteBase {
     sql(s"UPDATE $tableNameAsString SET salary = -1 WHERE pk = 1")
 
     val writeSchema = table.lastWriteInfo.schema()
-    assert(writeSchema.fieldNames.contains("salary"),
-      s"salary must be in write schema (assigned): $writeSchema")
-    assert(writeSchema.fieldNames.contains("pk"),
-      s"pk must be in write schema " +
-        s"(connector pass-through via requiredDataAttributes): $writeSchema")
-    assert(!writeSchema.fieldNames.contains("id"),
-      s"id must not be in write schema: $writeSchema")
+    assert(writeSchema.fieldNames.contains("salary"), s"salary must be in write schema: $writeSchema")
+    assert(writeSchema.fieldNames.contains("pk"), s"pk must be in write schema: $writeSchema")
+    assert(!writeSchema.fieldNames.contains("id"), s"id must not be in write schema: $writeSchema")
     assert(!writeSchema.fieldNames.contains("dep"),
-      s"dep must not be in write schema (partitioning, not a data column to write): $writeSchema")
+      s"dep must not be in write schema: $writeSchema")
   }
 
   test("column-update from-info: pk already in updatedColumns is not duplicated") {
-    // When the user updates pk itself, updatedColumns=[pk, salary].
-    // Connector sees pk already present -> requiredDataAttributes=[pk, salary] (no dup).
     createAndInitTableFromInfo("pk INT NOT NULL, salary INT, dep STRING",
       """{ "pk": 1, "salary": 100, "dep": "hr" }
         |{ "pk": 2, "salary": 200, "dep": "software" }
@@ -502,125 +457,12 @@ class DeltaBasedColumnUpdateTableSuite extends RowLevelOperationSuiteBase {
 
     sql(s"UPDATE $tableNameAsString SET salary = -1 WHERE dep = 'hr'")
 
-    // salary updated for hr rows; id preserved (not in write schema, connector uses pk lookup)
     checkAnswer(
       sql(s"SELECT * FROM $tableNameAsString ORDER BY pk"),
       Row(1, -1, 10, "hr") ::
       Row(2, 200, 20, "software") ::
       Row(3, -1, 30, "hr") :: Nil)
   }
-
-  // ---------------------------------------------------------------------------
-  // CoW connector with supportsColumnUpdates() on RowLevelOperation.
-  // PartitionBasedColumnUpdateOperation declares requiredDataAttributes() = [pk, dep] and
-  // supportsColumnUpdates() = true.  Spark narrows the scan to connector-declared + assigned
-  // columns; bonus is excluded.  The connector reconstructs full rows via pk lookup.
-  // ---------------------------------------------------------------------------
-
-  private def createAndInitTableCoW(schemaString: String, jsonData: String): Unit = {
-    val props = new java.util.HashMap[String, String]()
-    props.put("column-update-cow", "true")
-    val columns = CatalogV2Util.structTypeToV2Columns(StructType.fromDDL(schemaString))
-    val transforms = Array[Transform](identity(reference(Seq("dep"))))
-    val tableInfo = new TableInfo.Builder()
-      .withColumns(columns)
-      .withPartitions(transforms)
-      .withProperties(props)
-      .build()
-    catalog.createTable(ident, tableInfo)
-    append(schemaString, jsonData)
-  }
-
-  test("column-update CoW: scan excludes columns not declared and not assigned") {
-    // Connector declares [pk, dep].  SET salary = -1.
-    // Narrow scan = pk (declared) + dep (declared + condition + partitioning)
-    // + salary (assigned LHS).  bonus is neither declared nor assigned -> excluded.
-    createAndInitTableCoW("pk INT NOT NULL, salary INT, bonus INT, dep STRING",
-      """{ "pk": 1, "salary": 100, "bonus": 10, "dep": "hr" }
-        |{ "pk": 2, "salary": 200, "bonus": 20, "dep": "software" }
-        |{ "pk": 3, "salary": 300, "bonus": 30, "dep": "hr" }
-        |""".stripMargin)
-
-    sql(s"UPDATE $tableNameAsString SET salary = -1 WHERE dep = 'hr'")
-
-    val scanSchema = table.lastScanSchema
-    assert(scanSchema.fieldNames.contains("pk"), s"pk must be in scan: $scanSchema")
-    assert(scanSchema.fieldNames.contains("dep"), s"dep must be in scan: $scanSchema")
-    assert(scanSchema.fieldNames.contains("salary"),
-      s"salary must be in scan (assigned LHS): $scanSchema")
-    assert(!scanSchema.fieldNames.contains("bonus"), s"bonus must be excluded: $scanSchema")
-  }
-
-  test("column-update CoW: write schema contains only declared + assigned columns") {
-    createAndInitTableCoW("pk INT NOT NULL, salary INT, bonus INT, dep STRING",
-      """{ "pk": 1, "salary": 100, "bonus": 10, "dep": "hr" }
-        |{ "pk": 2, "salary": 200, "bonus": 20, "dep": "software" }
-        |""".stripMargin)
-
-    sql(s"UPDATE $tableNameAsString SET salary = -1 WHERE dep = 'hr'")
-
-    val writeSchema = table.lastWriteInfo.schema()
-    assert(writeSchema.fieldNames.contains("pk"), s"pk must be in write schema: $writeSchema")
-    assert(writeSchema.fieldNames.contains("dep"), s"dep must be in write schema: $writeSchema")
-    assert(writeSchema.fieldNames.contains("salary"),
-      s"salary must be in write schema: $writeSchema")
-    assert(!writeSchema.fieldNames.contains("bonus"),
-      s"bonus must not be in write schema: $writeSchema")
-  }
-
-  test("column-update CoW: data correctness -- bonus preserved, salary updated") {
-    // bonus is not in the write schema; the connector must preserve it from the original row.
-    createAndInitTableCoW("pk INT NOT NULL, salary INT, bonus INT, dep STRING",
-      """{ "pk": 1, "salary": 100, "bonus": 10, "dep": "hr" }
-        |{ "pk": 2, "salary": 200, "bonus": 20, "dep": "software" }
-        |{ "pk": 3, "salary": 300, "bonus": 30, "dep": "hr" }
-        |""".stripMargin)
-
-    sql(s"UPDATE $tableNameAsString SET salary = -1 WHERE dep = 'hr'")
-
-    checkAnswer(
-      sql(s"SELECT * FROM $tableNameAsString ORDER BY pk"),
-      Row(1, -1, 10, "hr") ::
-      Row(2, 200, 20, "software") ::
-      Row(3, -1, 30, "hr") :: Nil)
-  }
-
-  test("column-update CoW: narrow scan + subquery WHERE condition") {
-    // Exercises buildReplaceDataWithUnionPlan + narrow scan + the flatMap change in
-    // RowLevelOperationRuntimeGroupFiltering.buildTableToScanAttrMap.
-    // The subquery forces the UNION path (updated rows + remaining rows).
-    // bonus is not declared and not assigned, must be excluded from scan and write
-    // but the subquery-based filter must still work correctly with the narrow scan.
-    createAndInitTableCoW("pk INT NOT NULL, salary INT, bonus INT, dep STRING",
-      """{ "pk": 1, "salary": 100, "bonus": 10, "dep": "hr" }
-        |{ "pk": 2, "salary": 200, "bonus": 20, "dep": "software" }
-        |{ "pk": 3, "salary": 300, "bonus": 30, "dep": "hr" }
-        |""".stripMargin)
-
-    import testImplicits._
-    val subqueryDF = Seq("hr").toDF()
-    subqueryDF.createOrReplaceTempView("target_deps")
-
-    sql(
-      s"""UPDATE $tableNameAsString
-         |SET salary = -1
-         |WHERE dep IN (SELECT * FROM target_deps)
-         |""".stripMargin)
-
-    checkAnswer(
-      sql(s"SELECT * FROM $tableNameAsString ORDER BY pk"),
-      Row(1, -1, 10, "hr") ::
-      Row(2, 200, 20, "software") ::
-      Row(3, -1, 30, "hr") :: Nil)
-  }
-
-  // ---------------------------------------------------------------------------
-  // Delta connector with representUpdateAsDeleteAndInsert=true AND supportsColumnUpdates=true.
-  //
-  // Point 7: The restriction that blocked column-level updates on the delete+reinsert path
-  // has been removed.  The REINSERT leg of the Expand uses only assigned values (the narrow
-  // write schema from effectiveRowAttrs), and the DELETE leg uses row ID only.
-  // ---------------------------------------------------------------------------
 
   private def createAndInitTableSplit(schemaString: String, jsonData: String): Unit = {
     val props = new java.util.HashMap[String, String]()
@@ -637,10 +479,6 @@ class DeltaBasedColumnUpdateTableSuite extends RowLevelOperationSuiteBase {
   }
 
   test("column-update split: write schema is narrow (assigned + pk pass-through)") {
-    // representUpdateAsDeleteAndInsert=true + supportsColumnUpdates=true.
-    // requiredDataAttributes() = [pk, id] (pk always declared; id because it's being updated).
-    // The write schema = requiredDataAttributes() in declared order = {pk, id}.
-    // dep is NOT in the write schema (not declared, not assigned).
     createAndInitTableSplit("pk INT NOT NULL, id INT, dep STRING",
       """{ "pk": 1, "id": 1, "dep": "hr" }
         |{ "pk": 2, "id": 2, "dep": "software" }
@@ -648,7 +486,6 @@ class DeltaBasedColumnUpdateTableSuite extends RowLevelOperationSuiteBase {
 
     sql(s"UPDATE $tableNameAsString SET id = -1 WHERE pk = 1")
 
-    // Write schema is exactly requiredDataAttributes = {pk, id} in declared order.
     checkLastWriteInfo(
       expectedRowSchema = StructType(Seq(
         StructField("pk", IntegerType, nullable = false),
@@ -659,8 +496,6 @@ class DeltaBasedColumnUpdateTableSuite extends RowLevelOperationSuiteBase {
   }
 
   test("column-update split: data correctness") {
-    // representUpdateAsDeleteAndInsert=true + supportsColumnUpdates=true.
-    // The connector receives narrow REINSERT rows and must reconstruct full rows.
     createAndInitTableSplit("pk INT NOT NULL, id INT, dep STRING",
       """{ "pk": 1, "id": 1, "dep": "hr" }
         |{ "pk": 2, "id": 2, "dep": "software" }
@@ -674,4 +509,3 @@ class DeltaBasedColumnUpdateTableSuite extends RowLevelOperationSuiteBase {
       Row(1, -1, "hr") :: Row(2, 2, "software") :: Row(3, -1, "hr") :: Nil)
   }
 }
-

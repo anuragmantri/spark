@@ -43,8 +43,7 @@ object RewriteUpdateTable extends RewriteRowLevelCommand {
       EliminateSubqueryAliases(aliasedTable) match {
         case r @ ExtractV2Table(tbl: SupportsRowLevelOperations) =>
           val updatedCols = assignments.collect {
-            case Assignment(key: AttributeReference, value)
-                if !isIdentityAssignment(key, value) =>
+            case Assignment(key: AttributeReference, value) if !isIdentityAssignment(key, value) =>
               FieldReference(key.name)
           }
           val table = buildOperationTable(tbl, UPDATE, CaseInsensitiveStringMap.empty(),
@@ -72,17 +71,18 @@ object RewriteUpdateTable extends RewriteRowLevelCommand {
       assignments: Seq[Assignment],
       cond: Expression): ReplaceData = {
 
-    val (readRelation, rowAttrs) = buildCoWReadSetup(relation, operationTable, assignments, cond)
+    val (readRelation, rowAttrs, metadataAttrs) =
+      buildReplaceDataReadRelation(relation, operationTable, assignments, cond)
 
     val updatedAndRemainingRowsPlan = buildReplaceDataUpdateProjection(
       readRelation, assignments, cond)
 
     val writeRelation = relation.copy(table = operationTable)
-    val query = updatedAndRemainingRowsPlan
-    val metadataAttrs = resolveRequiredMetadataAttrs(relation, operationTable.operation)
-    val projections = buildReplaceDataProjections(query, rowAttrs, metadataAttrs)
+    val projections = buildReplaceDataProjections(updatedAndRemainingRowsPlan, rowAttrs,
+      metadataAttrs)
     val groupFilterCond = if (groupFilterEnabled) Some(cond) else None
-    ReplaceData(writeRelation, cond, query, relation, projections, groupFilterCond)
+    ReplaceData(writeRelation, cond, updatedAndRemainingRowsPlan, relation, projections,
+      groupFilterCond)
   }
 
   // build a rewrite plan for sources that support replacing groups of data (e.g. files, partitions)
@@ -93,7 +93,8 @@ object RewriteUpdateTable extends RewriteRowLevelCommand {
       assignments: Seq[Assignment],
       cond: Expression): ReplaceData = {
 
-    val (readRelation, rowAttrs) = buildCoWReadSetup(relation, operationTable, assignments, cond)
+    val (readRelation, rowAttrs, metadataAttrs) =
+      buildReplaceDataReadRelation(relation, operationTable, assignments, cond)
 
     // build a plan for updated records that match the condition
     val matchedRowsPlan = Filter(cond, readRelation)
@@ -107,36 +108,29 @@ object RewriteUpdateTable extends RewriteRowLevelCommand {
     val updatedAndRemainingRowsPlan = Union(updatedRowsPlan, remainingRowsPlan)
 
     val writeRelation = relation.copy(table = operationTable)
-    val query = updatedAndRemainingRowsPlan
-    val metadataAttrs = resolveRequiredMetadataAttrs(relation, operationTable.operation)
-    val projections = buildReplaceDataProjections(query, rowAttrs, metadataAttrs)
+    val projections = buildReplaceDataProjections(updatedAndRemainingRowsPlan, rowAttrs,
+      metadataAttrs)
     val groupFilterCond = if (groupFilterEnabled) Some(cond) else None
-    ReplaceData(writeRelation, cond, query, relation, projections, groupFilterCond)
+    ReplaceData(writeRelation, cond, updatedAndRemainingRowsPlan, relation, projections,
+      groupFilterCond)
   }
 
-  // Common read-relation setup shared by both CoW plan builders.
-  //
-  // When the connector supports column updates and declares required data attributes,
-  // the read relation is narrowed at analysis time so that
-  // GroupBasedRowLevelOperationScanPlanning uses only the needed columns for the scan.
-  // Otherwise the full relation output is used.
-  private def buildCoWReadSetup(
+  /**
+   * When the connector supports column updates and declares required data attributes,
+   * the read relation is narrowed at analysis time so that GroupBasedRowLevelOperationScanPlanning
+   * uses only the needed columns for the scan. Otherwise, the full relation output is used.
+   */
+  private def buildReplaceDataReadRelation(
       relation: DataSourceV2Relation,
       operationTable: RowLevelOperationTable,
       assignments: Seq[Assignment],
-      cond: Expression): (DataSourceV2Relation, Seq[Attribute]) = {
+      cond: Expression): (DataSourceV2Relation, Seq[Attribute], Seq[AttributeReference]) = {
 
     val operation = operationTable.operation
     val metadataAttrs = resolveRequiredMetadataAttrs(relation, operation)
     val connectorDataAttrs = resolveRequiredDataAttrs(relation, operation)
     val isNarrow = operation.supportsColumnUpdates() && connectorDataAttrs.nonEmpty
 
-    // CoW scan narrowing must be done manually at analysis time.
-    // GroupBasedRowLevelOperationScanPlanning (an optimizer rule that fires after analysis)
-    // always reads relation.output directly when building the physical scan -- it does not
-    // observe Project nodes above the relation, so optimizer-driven column pruning has no
-    // effect on CoW scans.  We narrow DataSourceV2Relation.output here so that rule picks
-    // up the narrow set.
     val readRelation = if (isNarrow) {
       val allRequired = (connectorDataAttrs ++ computeAssignedAttrs(assignments)).distinct
       buildRelationWithAttrs(relation, operationTable, metadataAttrs, dataAttrs = allRequired,
@@ -145,30 +139,24 @@ object RewriteUpdateTable extends RewriteRowLevelCommand {
       buildRelationWithAttrs(relation, operationTable, metadataAttrs)
     }
 
-    // CoW write schema (two paths only, no heuristic for CoW):
-    // - Narrow path (connectorDataAttrs declared): exactly connector-declared cols in declared
-    //   order.  The connector must declare ALL columns it wants to receive.
-    // - Full path (connectorDataAttrs empty OR supportsColumnUpdates=false): full table output.
-    //   Unlike MOR, CoW does not have a heuristic assigned-only path because
-    //   GroupBasedRowLevelOperationScanPlanning needs explicit column declarations to narrow.
     val rowAttrs: Seq[Attribute] = if (isNarrow) connectorDataAttrs else relation.output
 
-    (readRelation, rowAttrs)
+    (readRelation, rowAttrs, metadataAttrs)
   }
 
-  // this method assumes the assignments have been already aligned before
-  //
-  // Works for both the full-scan and narrow-scan CoW paths.  In the narrow case,
-  // readRelation.output is already restricted by buildCoWReadSetup, so projecting
-  // all plan.output gives the correct narrow write schema.
+  /**
+   * Builds the update projection for ReplaceData plans. Assumes assignments are already aligned.
+   *
+   * plan.output may be narrowed by buildReplaceDataReadRelation, so only columns present in the
+   * plan are projected.
+   */
   private def buildReplaceDataUpdateProjection(
       plan: LogicalPlan,
       assignments: Seq[Assignment],
       cond: Expression = TrueLiteral): LogicalPlan = {
 
-    // Build a name-keyed map via AttributeMap (compares by exprId internally) so we can look
-    // up each plan column's assignment without relying on positional ordering.  This is more
-    // robust than position-based indexing and works correctly for any plan output layout.
+    // plan.output may be narrowed (fewer columns than assignments) or reordered,
+    // so assignments are matched by exprId.
     val assignmentMap = AttributeMap(assignments.collect {
       case Assignment(key: Attribute, value) => key -> value
     })
@@ -186,8 +174,7 @@ object RewriteUpdateTable extends RewriteRowLevelCommand {
           case Some(assignedExpr) =>
             Alias(If(cond, assignedExpr, attr), attr.name)()
           case None =>
-            // Column is present in the scan but has no assignment -- pass through unchanged.
-            // In the narrow CoW path these are connector-declared columns not being updated.
+            // Column in relation.output with no matching assignment; pass through unchanged.
             attr
         }
       }
@@ -206,26 +193,19 @@ object RewriteUpdateTable extends RewriteRowLevelCommand {
       cond: Expression): WriteDelta = {
 
     val operation = operationTable.operation.asInstanceOf[SupportsDelta]
-    // Column-update support applies to the standard delta path and the delete+reinsert path.
-    // When representUpdateAsDeleteAndInsert is true, the REINSERT leg of the Expand already
-    // uses only assigned values, so the narrow effectiveRowAttrs applies correctly.
     val supportsColumnUpdate = operation.supportsColumnUpdates()
 
-    // resolve all needed attrs (e.g. row ID and any required metadata attrs)
     val rowIdAttrs = resolveRowIdAttrs(relation, operation)
     val metadataAttrs = resolveRequiredMetadataAttrs(relation, operation)
 
-    // Connector-declared data attrs used to determine pass-through columns in the write plan.
     val connectorDataAttrs = if (supportsColumnUpdate) {
       resolveRequiredDataAttrs(relation, operation)
     } else Nil
 
-    // MOR uses a full-schema scan; ColumnPruning narrows it via Project references.
     val readRelation = buildRelationWithAttrs(relation, operationTable, metadataAttrs, rowIdAttrs)
 
-    // Connector-required attrs that are NOT being assigned are added as pass-throughs in the
-    // plan so that ColumnPruning keeps them in the physical scan AND the connector receives
-    // their current values via DeltaWriter.update's row argument.
+    // Connector-declared attrs not being assigned are passed through so ColumnPruning
+    // keeps them in the scan and the connector receives their current values.
     val assignedAttrs = if (supportsColumnUpdate) computeAssignedAttrs(assignments)
                         else relation.output
     val connectorExtraAttrs: Seq[AttributeReference] = if (connectorDataAttrs.nonEmpty) {
@@ -244,12 +224,6 @@ object RewriteUpdateTable extends RewriteRowLevelCommand {
       buildWriteDeltaUpdateProjection(matchedRowsPlan, assignments, rowIdAttrs)
     }
 
-    // Effective row write schema:
-    // - Narrow path (connectorDataAttrs declared): exactly connector-declared cols in declared
-    //   order.  The connector must declare ALL columns it wants to receive (including updated
-    //   ones).  This mirrors the metadata pattern and enables strict areCompatible validation.
-    // - Heuristic path (connectorDataAttrs empty): only the assigned (changed) columns.
-    // - Full path (no column-update support): full table output.
     val effectiveRowAttrs = if (supportsColumnUpdate && connectorDataAttrs.nonEmpty) {
       connectorDataAttrs
     } else if (supportsColumnUpdate) {
@@ -266,23 +240,11 @@ object RewriteUpdateTable extends RewriteRowLevelCommand {
     WriteDelta(writeRelation, cond, rowDeltaPlan, relation, projections, groupFilterCond)
   }
 
-  // Builds the row delta projection for the column update path.
-  //
-  // The resulting Project references only:
-  //   - assigned column values (new values being written)
-  //   - connector pass-through values (connector declared but not assigned)
-  //   - metadata columns (nulled or preserved)
-  //   - row ID columns (for delta identification)
-  //   - original row ID values (only when a row ID column is being reassigned)
-  //
-  // ColumnPruning observes exactly these references and narrows the physical scan accordingly.
-  // Connectors that need additional columns in the scan (e.g., partition columns for
-  // distribution) should declare them in requiredDataAttributes().
-  //
-  // Note: AlignUpdateAssignments guarantees all assignment keys are top-level
-  // AttributeReferences even for nested field updates (e.g., SET col1.field = 'x' becomes
-  // Assignment(col1: AttributeReference, CreateNamedStruct(...))), so isIdentityAssignment
-  // correctly identifies non-updating assignments.
+  /**
+   * Builds the WriteDelta projection for the column update path. The resulting Project
+   * references only the columns needed for the write, so ColumnPruning narrows the scan
+   * to match.
+   */
   private def buildColumnUpdateProjection(
       plan: LogicalPlan,
       assignments: Seq[Assignment],
@@ -290,21 +252,16 @@ object RewriteUpdateTable extends RewriteRowLevelCommand {
       metadataAttrs: Seq[Attribute],
       connectorExtraAttrs: Seq[AttributeReference] = Nil): LogicalPlan = {
 
-    // only emit values for non-identity assignments (the narrow write schema)
     val assignedValues = assignments.collect {
       case Assignment(key: Attribute, value) if !isIdentityAssignment(key, value) =>
         Alias(value, key.name)()
     }
 
-    // Connector-required data attrs that are not being assigned are passed through as-is
-    // so that (a) ColumnPruning keeps them in the physical scan, and (b) the connector
-    // receives their current values via DeltaWriter.update's row argument.
     val connectorExtraAttrSet = AttributeSet(connectorExtraAttrs)
     val connectorPassThroughValues = plan.output.filter { a =>
       connectorExtraAttrSet.contains(a) && !MetadataAttribute.isValid(a.metadata)
     }
 
-    // pass through or null out metadata columns present in the scan
     val metadataAttrSet = AttributeSet(metadataAttrs)
     val metadataValues = plan.output.filter(metadataAttrSet.contains).map { attr =>
       if (MetadataAttribute.isPreservedOnUpdate(attr)) {
@@ -314,7 +271,6 @@ object RewriteUpdateTable extends RewriteRowLevelCommand {
       }
     }
 
-    // pass through row ID columns from the scan
     val rowIdAttrSet = AttributeSet(rowIdAttrs)
     val rowIdValues = plan.output.filter(rowIdAttrSet.contains)
 

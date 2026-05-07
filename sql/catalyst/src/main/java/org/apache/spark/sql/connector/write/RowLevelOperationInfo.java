@@ -49,7 +49,7 @@ public interface RowLevelOperationInfo {
    * whether pk is already in the updated columns list and, if not, add it to
    * requiredDataAttributes().
    *
-   * @since 4.2.0
+   * @since 4.3.0
    */
   default NamedReference[] updatedColumns() {
     return new NamedReference[0];

@@ -106,7 +106,6 @@ public interface RowLevelOperation {
     return new NamedReference[0];
   }
 
-
   /**
    * Controls whether to send only the required data columns to the connector rather than the
    * full row.
@@ -120,8 +119,10 @@ public interface RowLevelOperation {
    * those columns in declared order. The connector must include all columns it wants to receive,
    * including the columns being updated. If {@link #requiredDataAttributes()} returns an empty
    * array, Spark sends only the non-identity assigned columns (heuristic path).
+   * <p>
+   * Currently only consulted for UPDATE operations.
    *
-   * @since 4.2.0
+   * @since 4.3.0
    */
   default boolean supportsColumnUpdates() {
     return false;
@@ -140,8 +141,10 @@ public interface RowLevelOperation {
    * assigned, then add any extra columns needed for row lookup or routing (e.g., primary key).
    * <p>
    * When empty (the default), Spark falls back to sending only the non-identity assigned columns.
+   * <p>
+   * Currently only consulted for UPDATE operations.
    *
-   * @since 4.2.0
+   * @since 4.3.0
    */
   default NamedReference[] requiredDataAttributes() {
     return new NamedReference[0];

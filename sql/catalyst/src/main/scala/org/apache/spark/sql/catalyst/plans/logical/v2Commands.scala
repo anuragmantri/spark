@@ -386,19 +386,19 @@ case class ReplaceData(
   // validates row projection output is compatible with table attributes
   private def rowAttrsResolved: Boolean = {
     val inRowAttrs = DataTypeUtils.toAttributes(projections.rowProjection.schema)
-    table.skipSchemaResolution ||
-      areCompatible(inRowAttrs, table.output) ||
+    table.skipSchemaResolution || areCompatible(inRowAttrs, table.output) ||
       dataAttrsResolved(inRowAttrs)
   }
 
-  // Validates the narrow-write-schema row projection output.
-  //
-  // When the connector declares specific data attributes via requiredDataAttributes(), the
-  // write schema must exactly match projectedDataAttrs (same columns, same order).  This is
-  // symmetric with metadataAttrsResolved: the connector's declared attrs define the write schema.
-  //
-  // When requiredDataAttributes() is empty (heuristic path), the write schema contains only
-  // the assigned columns.  We validate each one exists in the table with a compatible type.
+  /**
+   * Validates the narrow-write-schema row projection output.
+   *
+   * When the connector declares specific data attributes via requiredDataAttributes(), the
+   * write schema must exactly match projectedDataAttrs (same columns, same order).
+   *
+   * When requiredDataAttributes() is empty, the write schema contains only
+   * the assigned columns. We validate each one exists in the table with a compatible type.
+   */
   private def dataAttrsResolved(inRowAttrs: Seq[Attribute]): Boolean = {
     if (!operation.supportsColumnUpdates()) { return false }
     val outDataAttrs = projectedDataAttrs
@@ -506,12 +506,19 @@ case class WriteDelta(
       case Some(projection) => DataTypeUtils.toAttributes(projection.schema)
       case None => Nil
     }
-    table.skipSchemaResolution ||
-      areCompatible(inRowAttrs, outRowAttrs) ||
+    table.skipSchemaResolution || areCompatible(inRowAttrs, outRowAttrs) ||
       dataAttrsResolved(inRowAttrs)
   }
 
-  // Validates the narrow-write-schema row projection.  Symmetric with ReplaceData.
+  /**
+   * Validates the narrow-write-schema row projection output.
+   *
+   * When the connector declares specific data attributes via requiredDataAttributes(), the
+   * write schema must exactly match projectedDataAttrs (same columns, same order).
+   *
+   * When requiredDataAttributes() is empty, the write schema contains only
+   * the assigned columns. We validate each one exists in the table with a compatible type.
+   */
   private def dataAttrsResolved(inRowAttrs: Seq[Attribute]): Boolean = {
     if (!operation.supportsColumnUpdates()) { return false }
     val outDataAttrs = projectedDataAttrs

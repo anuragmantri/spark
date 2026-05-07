@@ -23,11 +23,6 @@ abstract class DeltaBasedUpdateTableSuiteBase extends UpdateTableSuiteBase {
 
   override protected def deltaUpdate: Boolean = true
 
-  // ---------------------------------------------------------------------------
-  // RowLevelOperationInfo.updatedColumns() -- Spark informs the connector which
-  // columns are genuinely being updated (non-identity assignments only).
-  // ---------------------------------------------------------------------------
-
   test("updatedColumns: single non-identity assignment") {
     createAndInitTable("pk INT NOT NULL, id INT, dep STRING",
       """{ "pk": 1, "id": 1, "dep": "hr" }
@@ -53,7 +48,6 @@ abstract class DeltaBasedUpdateTableSuiteBase extends UpdateTableSuiteBase {
       """{ "pk": 1, "id": 1, "dep": "hr" }
         |""".stripMargin)
 
-    // dep = dep is an identity assignment and must NOT appear in updatedColumns
     sql(s"UPDATE $tableNameAsString SET id = -1, dep = dep WHERE pk = 1")
 
     checkLastUpdatedColumns("id")
@@ -85,7 +79,7 @@ abstract class DeltaBasedUpdateTableSuiteBase extends UpdateTableSuiteBase {
       """{ "pk": 1, "id": 1, "dep": "hr" }
         |""".stripMargin)
 
-    // SET id = dep assigns a different column's value to id -- not identity
+    // SET id = dep assigns a different column's value -- not identity
     sql(s"UPDATE $tableNameAsString SET id = 0, dep = dep WHERE pk = 1")
 
     checkLastUpdatedColumns("id")

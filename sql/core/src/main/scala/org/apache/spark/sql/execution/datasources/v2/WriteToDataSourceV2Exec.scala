@@ -354,9 +354,15 @@ case class ReplaceDataExec(
   override def writingTask: WritingSparkTask[_] = {
     projections.metadataProjection match {
       case Some(metadataProj) =>
-        DataAndMetadataWritingSparkTask(projections.rowProjection, metadataProj, sparkMetrics)
+        DataAndMetadataWritingSparkTask(
+          projections.rowProjection,
+          projections.updateRowProjection.orNull,
+          metadataProj, sparkMetrics)
       case None =>
-        DataWithProjectionWritingSparkTask(projections.rowProjection, sparkMetrics)
+        DataWithProjectionWritingSparkTask(
+          projections.rowProjection,
+          projections.updateRowProjection.orNull,
+          sparkMetrics)
     }
   }
 
@@ -711,6 +717,7 @@ trait WritingSparkTask[W <: DataWriter[InternalRow]] extends Logging with Serial
 
 case class DataAndMetadataWritingSparkTask(
     dataProj: ProjectingInternalRow,
+    updateDataProj: ProjectingInternalRow,
     metadataProj: ProjectingInternalRow,
     sparkMetrics: Map[String, SQLMetric])
   extends WritingSparkTask[DataWriter[InternalRow]] {
@@ -719,6 +726,8 @@ case class DataAndMetadataWritingSparkTask(
       writer: DataWriter[InternalRow], iter: java.util.Iterator[InternalRow]): Unit = {
     var numUpdatedRows = 0L
     var numCopiedRows = 0L
+    val proj = if (updateDataProj != null) updateDataProj else dataProj
+    val useWriteUpdate = updateDataProj != null
 
     while (iter.hasNext) {
       val row = iter.next()
@@ -727,15 +736,17 @@ case class DataAndMetadataWritingSparkTask(
       operation match {
         case UPDATE_OPERATION =>
           numUpdatedRows += 1L
-          dataProj.project(row)
+          proj.project(row)
           metadataProj.project(row)
-          writer.write(metadataProj, dataProj)
+          if (useWriteUpdate) writer.writeUpdate(metadataProj, proj)
+          else writer.write(metadataProj, proj)
 
         case COPY_OPERATION =>
           numCopiedRows += 1L
-          dataProj.project(row)
+          proj.project(row)
           metadataProj.project(row)
-          writer.write(metadataProj, dataProj)
+          if (useWriteUpdate) writer.writeUpdate(metadataProj, proj)
+          else writer.write(metadataProj, proj)
 
         case INSERT_OPERATION =>
           dataProj.project(row)
@@ -753,6 +764,7 @@ case class DataAndMetadataWritingSparkTask(
 
 case class DataWithProjectionWritingSparkTask(
     dataProj: ProjectingInternalRow,
+    updateDataProj: ProjectingInternalRow,
     sparkMetrics: Map[String, SQLMetric])
   extends WritingSparkTask[DataWriter[InternalRow]] {
 
@@ -760,6 +772,8 @@ case class DataWithProjectionWritingSparkTask(
       writer: DataWriter[InternalRow], iter: java.util.Iterator[InternalRow]): Unit = {
     var numUpdatedRows = 0L
     var numCopiedRows = 0L
+    val proj = if (updateDataProj != null) updateDataProj else dataProj
+    val useWriteUpdate = updateDataProj != null
 
     while (iter.hasNext) {
       val row = iter.next()
@@ -768,13 +782,15 @@ case class DataWithProjectionWritingSparkTask(
       operation match {
         case UPDATE_OPERATION =>
           numUpdatedRows += 1L
-          dataProj.project(row)
-          writer.write(dataProj)
+          proj.project(row)
+          if (useWriteUpdate) writer.writeUpdate(proj)
+          else writer.write(proj)
 
         case COPY_OPERATION =>
           numCopiedRows += 1L
-          dataProj.project(row)
-          writer.write(dataProj)
+          proj.project(row)
+          if (useWriteUpdate) writer.writeUpdate(proj)
+          else writer.write(proj)
 
         case INSERT_OPERATION =>
           dataProj.project(row)

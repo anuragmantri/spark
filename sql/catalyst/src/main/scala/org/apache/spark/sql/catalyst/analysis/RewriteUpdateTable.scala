@@ -290,17 +290,6 @@ object RewriteUpdateTable extends RewriteRowLevelCommand {
     }
   }
 
-  private def isIdentityAssignment(key: Attribute, value: Expression): Boolean = {
-    val unwrapped = value match {
-      case Alias(child, _) => child
-      case other => other
-    }
-    unwrapped match {
-      case attr: Attribute => AttributeSet(Seq(key)).contains(attr)
-      case _ => false
-    }
-  }
-
   // this method assumes the assignments have been already aligned before
   private def buildWriteDeltaUpdateProjection(
       plan: LogicalPlan,

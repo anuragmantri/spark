@@ -478,8 +478,14 @@ class InMemoryRowLevelOperationTable private (
               SortDirection.ASCENDING,
               SortDirection.ASCENDING.defaultNullOrdering()))
 
-          override def toBatch: BatchWrite =
-            PartitionBasedNarrowReplaceData(configuredScan, info.schema())
+          override def toBatch: BatchWrite = {
+            val narrowSchema = if (info.updateSchema().isPresent) {
+              info.updateSchema().get()
+            } else {
+              info.schema()
+            }
+            PartitionBasedNarrowReplaceData(configuredScan, narrowSchema, info.schema())
+          }
 
           override def description: String = "InMemoryNarrowCoWWrite"
         }
@@ -490,11 +496,12 @@ class InMemoryRowLevelOperationTable private (
   }
 
   // CoW write handler for narrow column-update writes.
-  // Receives rows with only the connector-declared + assigned columns.
-  // Reconstructs full rows by looking up the original row by pk and overlaying received columns.
+  // Narrow rows (UPDATE/COPY) are sent via writeUpdate, wide rows (INSERT) via write.
+  // Both arrive in the same buffer; rows are routed by their field count.
   private case class PartitionBasedNarrowReplaceData(
       scan: InMemoryBatchScan,
-      writeSchema: StructType) extends RowLevelOperationBatchWrite {
+      writeSchema: StructType,
+      fullSchema: StructType) extends RowLevelOperationBatchWrite {
 
     override def commit(messages: Array[WriterCommitMessage]): Unit = dataMap.synchronized {
       val newData = messages.map(_.asInstanceOf[BufferedRows])
@@ -506,24 +513,37 @@ class InMemoryRowLevelOperationTable private (
       val writeFieldIdx = writeSchema.fieldNames.zipWithIndex.toMap
       val pkIdxInWrite = writeFieldIdx("pk")
       val pkIdxInFull = schema.fieldIndex("pk")
+      val narrowFieldCount = writeSchema.fields.length
+      val fullFieldCount = fullSchema.fields.length
 
       val expandedData = newData.map { buf =>
         val expanded = new BufferedRows(buf.key, schema)
-        buf.rows.foreach { narrowRow =>
-          val pk = narrowRow.getInt(pkIdxInWrite)
-          val origRow = readRows.find(r => r.getInt(pkIdxInFull) == pk)
-          val fullRow = new GenericInternalRow(schema.length)
-          origRow.foreach { base =>
-            for (i <- schema.fields.indices) {
-              fullRow.update(i, base.get(i, schema.fields(i).dataType))
+        buf.rows.foreach { row =>
+          if (row.numFields == fullFieldCount && narrowFieldCount != fullFieldCount) {
+            // INSERT row: full schema, append directly aligned to table schema
+            val fullRow = new GenericInternalRow(schema.length)
+            schema.fields.zipWithIndex.foreach { case (field, i) =>
+              val srcIdx = fullSchema.fieldIndex(field.name)
+              fullRow.update(i, row.get(srcIdx, field.dataType))
             }
-          }
-          schema.fields.zipWithIndex.foreach { case (field, i) =>
-            writeFieldIdx.get(field.name).foreach { j =>
-              fullRow.update(i, narrowRow.get(j, field.dataType))
+            expanded.rows.append(fullRow)
+          } else {
+            // UPDATE/COPY narrow row: look up base row by pk, overlay narrow values
+            val pk = row.getInt(pkIdxInWrite)
+            val origRow = readRows.find(r => r.getInt(pkIdxInFull) == pk)
+            val fullRow = new GenericInternalRow(schema.length)
+            origRow.foreach { base =>
+              for (i <- schema.fields.indices) {
+                fullRow.update(i, base.get(i, schema.fields(i).dataType))
+              }
             }
+            schema.fields.zipWithIndex.foreach { case (field, i) =>
+              writeFieldIdx.get(field.name).foreach { j =>
+                fullRow.update(i, row.get(j, field.dataType))
+              }
+            }
+            expanded.rows.append(fullRow)
           }
-          expanded.rows.append(fullRow)
         }
         expanded
       }

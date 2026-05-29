@@ -65,4 +65,21 @@ public interface LogicalWriteInfo {
     throw new SparkUnsupportedOperationException(
       "DATA_SOURCE_METADATA_SCHEMA_NOT_IMPLEMENTED", Map.of("class", getClass().getName()));
   }
+
+  /**
+   * Returns the schema of records passed to {@link DataWriter#writeUpdate(Object, Object)}
+   * for updated and copied records in row-level operations.
+   * <p>
+   * When non-empty, this schema is used for records that are updated or copied during
+   * row-level operations and may be narrower than {@link #schema()}. Connectors implementing
+   * column-level updates can use this to receive only the columns they need to materialize
+   * the update.
+   * <p>
+   * When empty (the default), {@link #schema()} is used for all records.
+   *
+   * @since 4.3.0
+   */
+  default Optional<StructType> updateSchema() {
+    return Optional.empty();
+  }
 }

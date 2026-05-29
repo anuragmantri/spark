@@ -83,6 +83,51 @@ public interface DataWriter<T> extends Closeable {
   }
 
   /**
+   * Writes one updated or copied record with metadata, using the narrow schema returned by
+   * {@link LogicalWriteInfo#updateSchema()}.
+   * <p>
+   * This method is called by Spark in place of {@link #write(Object, Object)} for records
+   * that are updated or copied during row-level operations when the connector implements
+   * column-level updates via {@link RowLevelOperation#supportsColumnUpdates()}. The record conforms
+   * to the update schema rather than the full table schema.
+   * <p>
+   * The default implementation delegates to {@link #write(Object, Object)} for backward
+   * compatibility.
+   * <p>
+   * If this method fails (by throwing an exception), {@link #abort()} will be called and this
+   * data writer is considered to have been failed.
+   *
+   * @throws IOException if failure happens during disk/network IO like writing files.
+   *
+   * @since 4.3.0
+   */
+  default void writeUpdate(T metadata, T record) throws IOException {
+    write(metadata, record);
+  }
+
+  /**
+   * Writes one updated or copied record without metadata, using the narrow schema returned by
+   * {@link LogicalWriteInfo#updateSchema()}.
+   * <p>
+   * This method is called by Spark in place of {@link #write(Object)} for records that are
+   * updated or copied during row-level operations when the connector implements column-level
+   * updates via {@link RowLevelOperation#supportsColumnUpdates()} and does not require metadata.
+   * The record conforms to the update schema rather than the full table schema.
+   * <p>
+   * The default implementation delegates to {@link #write(Object)} for backward compatibility.
+   * <p>
+   * If this method fails (by throwing an exception), {@link #abort()} will be called and this
+   * data writer is considered to have been failed.
+   *
+   * @throws IOException if failure happens during disk/network IO like writing files.
+   *
+   * @since 4.3.0
+   */
+  default void writeUpdate(T record) throws IOException {
+    write(record);
+  }
+
+  /**
    * Writes one record.
    * <p>
    * If this method fails (by throwing an exception), {@link #abort()} will be called and this

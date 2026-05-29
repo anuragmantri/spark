@@ -40,9 +40,11 @@ public interface RowLevelOperationInfo {
   Command command();
 
   /**
-   * Returns the columns being updated in an UPDATE statement, as non-identity assignments.
+   * Returns the columns being updated in an UPDATE or MERGE statement, as non-identity
+   * assignments.
    *
-   * <p>For DELETE and MERGE, returns an empty array.
+   * <p>For DELETE, returns an empty array. For MERGE, returns the union of columns
+   * assigned in WHEN MATCHED THEN UPDATE clauses (excluding identity assignments).
    *
    * <p>Connectors can use this to decide what {@link RowLevelOperation#requiredDataAttributes()}
    * to declare. For instance, a connector that needs its primary key for row lookup can check

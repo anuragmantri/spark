@@ -107,8 +107,10 @@ object V2Writes extends Rule[LogicalPlan] with PredicateHelper {
     case rd @ ReplaceData(r: DataSourceV2Relation, _, query, _, projections, _, None) =>
       val rowSchema = projections.rowProjection.schema
       val metadataSchema = projections.metadataProjection.map(_.schema)
+      val updateSchema = projections.updateRowProjection.map(_.schema)
       val writeOptions = mergeOptions(Map.empty, r.options.asCaseSensitiveMap.asScala.toMap)
-      val writeBuilder = newWriteBuilder(r.table, writeOptions, rowSchema, metadataSchema)
+      val writeBuilder = newWriteBuilder(r.table, writeOptions, rowSchema, metadataSchema,
+        updateSchema)
       val write = writeBuilder.build()
       val newQuery = DistributionAndOrderingUtils.prepareQuery(write, query, r.funCatalog)
       rd.copy(write = Some(write), query = newQuery)
@@ -160,6 +162,7 @@ object V2Writes extends Rule[LogicalPlan] with PredicateHelper {
       writeOptions: Map[String, String],
       rowSchema: StructType,
       metadataSchema: Option[StructType] = None,
+      updateSchema: Option[StructType] = None,
       queryId: String = UUID.randomUUID().toString): WriteBuilder = {
 
     val info = LogicalWriteInfoImpl(
@@ -167,7 +170,8 @@ object V2Writes extends Rule[LogicalPlan] with PredicateHelper {
       rowSchema,
       writeOptions.asOptions,
       rowIdSchema = None,
-      metadataSchema)
+      metadataSchema,
+      updateSchema)
     table.asWritable.newWriteBuilder(info)
   }
 
@@ -186,7 +190,8 @@ object V2Writes extends Rule[LogicalPlan] with PredicateHelper {
       rowSchema,
       writeOptions.asOptions,
       rowIdSchema,
-      metadataSchema)
+      metadataSchema,
+      updateSchema = None)
 
     val writeBuilder = table.asWritable.newWriteBuilder(info)
     assert(writeBuilder.isInstanceOf[DeltaWriteBuilder], s"$writeBuilder must be DeltaWriteBuilder")

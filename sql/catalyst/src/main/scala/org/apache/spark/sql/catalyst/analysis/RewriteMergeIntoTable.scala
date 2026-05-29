@@ -22,10 +22,11 @@ import org.apache.spark.sql.catalyst.expressions.{Alias, And, Attribute, Attribu
 import org.apache.spark.sql.catalyst.expressions.Literal.{FalseLiteral, TrueLiteral}
 import org.apache.spark.sql.catalyst.expressions.aggregate.AggregateExpression
 import org.apache.spark.sql.catalyst.plans.{FullOuter, Inner, JoinType, LeftAnti, LeftOuter, RightOuter}
-import org.apache.spark.sql.catalyst.plans.logical.{AppendData, DeleteAction, Filter, HintInfo, InsertAction, Join, JoinHint, LogicalPlan, MergeAction, MergeIntoTable, MergeRows, NO_BROADCAST_AND_REPLICATION, Project, ReplaceData, UpdateAction, WriteDelta}
+import org.apache.spark.sql.catalyst.plans.logical.{AppendData, Assignment, DeleteAction, Filter, HintInfo, InsertAction, Join, JoinHint, LogicalPlan, MergeAction, MergeIntoTable, MergeRows, NO_BROADCAST_AND_REPLICATION, Project, ReplaceData, UpdateAction, WriteDelta}
 import org.apache.spark.sql.catalyst.plans.logical.MergeRows.{Copy, Delete, Discard, Insert, Instruction, Keep, ROW_ID, Split, Update}
 import org.apache.spark.sql.catalyst.util.RowDeltaUtils.{COPY_OPERATION, INSERT_OPERATION, OPERATION_COLUMN, UPDATE_OPERATION}
 import org.apache.spark.sql.connector.catalog.SupportsRowLevelOperations
+import org.apache.spark.sql.connector.expressions.FieldReference
 import org.apache.spark.sql.connector.write.{RowLevelOperationTable, SupportsDelta}
 import org.apache.spark.sql.connector.write.RowLevelOperation.Command.MERGE
 import org.apache.spark.sql.errors.QueryCompilationErrors
@@ -125,7 +126,17 @@ object RewriteMergeIntoTable extends RewriteRowLevelCommand with PredicateHelper
       EliminateSubqueryAliases(aliasedTable) match {
         case r @ ExtractV2Table(tbl: SupportsRowLevelOperations) =>
           validateMergeIntoConditions(m)
-          val table = buildOperationTable(tbl, MERGE, CaseInsensitiveStringMap.empty())
+
+          val updatedCols = (matchedActions ++ notMatchedBySourceActions).collect {
+            case UpdateAction(_, assignments, _) => assignments.collect {
+              case a @ Assignment(key: AttributeReference, _)
+                  if !isIdentityAssignment(key, a.value) =>
+                FieldReference(key.name)
+            }
+          }.flatten.distinct
+
+          val table = buildOperationTable(tbl, MERGE, CaseInsensitiveStringMap.empty(),
+            updatedCols)
           table.operation match {
             case _: SupportsDelta =>
               buildWriteDeltaPlan(
@@ -182,9 +193,20 @@ object RewriteMergeIntoTable extends RewriteRowLevelCommand with PredicateHelper
       (TrueLiteral, None)
     }
 
+    val operation = operationTable.operation
+    val supportsColumnUpdate = operation.supportsColumnUpdates()
+    val connectorDataAttrs = if (supportsColumnUpdate) {
+      resolveRequiredDataAttrs(relation, operation)
+    } else Nil
+
+    val updateRowAttrs = if (supportsColumnUpdate && connectorDataAttrs.nonEmpty) {
+      connectorDataAttrs
+    } else Nil
+
     // build a plan to replace read groups in the table
     val writeRelation = relation.copy(table = operationTable)
-    val projections = buildReplaceDataProjections(mergeRowsPlan, relation.output, metadataAttrs)
+    val projections = buildReplaceDataProjections(
+      mergeRowsPlan, relation.output, metadataAttrs, updateRowAttrs)
     ReplaceData(writeRelation, pushableCond, mergeRowsPlan, relation, projections, groupFilterCond)
   }
 

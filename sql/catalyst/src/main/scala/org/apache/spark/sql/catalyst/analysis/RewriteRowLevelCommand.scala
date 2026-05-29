@@ -132,6 +132,17 @@ trait RewriteRowLevelCommand extends Rule[LogicalPlan] {
     V2ExpressionUtils.resolveRef[AttributeReference](FieldReference(name), plan)
   }
 
+  protected def isIdentityAssignment(key: Attribute, value: Expression): Boolean = {
+    val unwrapped = value match {
+      case Alias(child, _) => child
+      case other => other
+    }
+    unwrapped match {
+      case attr: Attribute => AttributeSet(Seq(key)).contains(attr)
+      case _ => false
+    }
+  }
+
   protected def deltaDeleteOutput(
       rowAttrs: Seq[Attribute],
       rowIdAttrs: Seq[Attribute],
@@ -213,11 +224,25 @@ trait RewriteRowLevelCommand extends Rule[LogicalPlan] {
   protected def buildReplaceDataProjections(
       plan: LogicalPlan,
       rowAttrs: Seq[Attribute],
-      metadataAttrs: Seq[Attribute]): ReplaceDataProjections = {
+      metadataAttrs: Seq[Attribute],
+      updateRowAttrs: Seq[Attribute] = Nil): ReplaceDataProjections = {
     val outputs = extractOutputs(plan)
 
-    val outputsWithRow = filterOutputs(outputs, OPERATIONS_WITH_ROW)
-    val rowProjection = newLazyProjection(plan, outputsWithRow, rowAttrs)
+    val rowProjection = if (updateRowAttrs.nonEmpty) {
+      val outputsForInsert = filterOutputs(outputs,
+        OPERATIONS_WITH_ROW -- Set(UPDATE_OPERATION, COPY_OPERATION))
+      newLazyProjection(plan, outputsForInsert, rowAttrs)
+    } else {
+      val outputsWithRow = filterOutputs(outputs, OPERATIONS_WITH_ROW)
+      newLazyProjection(plan, outputsWithRow, rowAttrs)
+    }
+
+    val updateRowProjection = if (updateRowAttrs.nonEmpty) {
+      val outputsForUpdate = filterOutputs(outputs, Set(UPDATE_OPERATION, COPY_OPERATION))
+      Some(newLazyProjection(plan, outputsForUpdate, updateRowAttrs))
+    } else {
+      None
+    }
 
     val metadataProjection = if (metadataAttrs.nonEmpty) {
       val outputsWithMetadata = filterOutputs(outputs, OPERATIONS_WITH_METADATA)
@@ -226,7 +251,7 @@ trait RewriteRowLevelCommand extends Rule[LogicalPlan] {
       None
     }
 
-    ReplaceDataProjections(rowProjection, metadataProjection)
+    ReplaceDataProjections(rowProjection, updateRowProjection, metadataProjection)
   }
 
   protected def buildWriteDeltaProjections(
